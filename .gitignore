@@ -1,0 +1,35 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# SSL Certs (never commit)
+nginx/ssl/
+ssl/
+
+# Node
+frontend/node_modules/
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Logs
+*.log
+nginx/logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Docker
+docker-compose.override.yml
+
+# Build artifacts
+*.tar.gz
+*.zip

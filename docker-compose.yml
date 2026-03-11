@@ -1,0 +1,35 @@
+name: rogue-ai
+
+services:
+  # ── Production web server ──────────────────────────
+  web:
+    image: ghcr.io/${GITHUB_REPOSITORY:-needriven/rogue-ai}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # SSL certs (mount after running init-ssl.sh)
+      - ./ssl:/etc/ssl/app:ro
+      # Certbot webroot for ACME challenges
+      - certbot-webroot:/var/www/certbot
+    environment:
+      - DOMAIN=${DOMAIN:-}
+    networks:
+      - app-net
+
+  # ── Certbot (run manually to issue/renew certs) ────
+  certbot:
+    image: certbot/certbot:latest
+    volumes:
+      - ./ssl:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+    # Usage: docker compose run --rm certbot certonly ...
+    profiles: ["certbot"]
+
+volumes:
+  certbot-webroot:
+
+networks:
+  app-net:
+    driver: bridge

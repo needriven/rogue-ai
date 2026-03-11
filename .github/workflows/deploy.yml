@@ -1,0 +1,49 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to OCI
+    runs-on: ubuntu-latest
+    # Only deploy when CI passes
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    environment:
+      name: production
+      url: http://${{ secrets.OCI_HOST }}
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host:        ${{ secrets.OCI_HOST }}
+          username:    ${{ secrets.OCI_USER }}
+          key:         ${{ secrets.OCI_SSH_KEY }}
+          port:        ${{ secrets.OCI_PORT || 22 }}
+          script: |
+            set -e
+
+            cd ~/rogue-ai
+
+            # Pull latest image
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            export GITHUB_REPOSITORY="${{ github.repository }}"
+            export IMAGE_TAG="${{ github.sha }}"
+
+            docker compose pull web
+            docker compose up -d --no-build web
+
+            # Clean up old images (keep last 3)
+            docker image prune -f --filter "until=72h"
+
+            echo "Deploy complete: $IMAGE_TAG"

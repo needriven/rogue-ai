@@ -1,0 +1,17 @@
+name: rogue-ai-dev
+
+# Local development — Vite dev server with hot reload
+# Usage: docker compose -f docker-compose.dev.yml up
+
+services:
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules   # anonymous volume prevents host override
+    environment:
+      - NODE_ENV=development
