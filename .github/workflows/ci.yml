@@ -158,9 +158,12 @@ jobs:
             # Authenticate to GHCR
             echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
-            # Sync latest compose/nginx config from repo
-            git fetch origin main
-            git checkout origin/main -- docker-compose.yml nginx/
+            # Sync latest docker-compose.yml from repo (curl, no git required)
+            curl -fsSL \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/docker-compose.yml?ref=$GITHUB_SHA" \
+              -o docker-compose.yml
 
             # Update image tag
             sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=$GITHUB_SHA|" .env
