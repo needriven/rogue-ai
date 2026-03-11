@@ -18,6 +18,9 @@ import {
   simulateDrops,
   isUpgradeUnlocked,
 } from '@/types/game'
+import type { ActiveEvent } from '@/types/events'
+import { pickEvent, EVENT_RATE, EVENT_POOL } from '@/types/events'
+import { checkAchievements, ACHIEVEMENTS } from '@/types/achievements'
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const TICK_MS        = 100
@@ -45,25 +48,30 @@ function pushLog(logs: LogEntry[], entry: LogEntry): LogEntry[] {
 // ── Default state ──────────────────────────────────────────────────────────
 function makeInitialState(): GameState {
   return {
-    cycles:             0,
-    cyclesPerSecond:    0,
-    totalCyclesEarned:  0,
-    nodes:              1,
-    memory:             256,
-    entropy:            0,
-    stage:              'genesis',
-    prestigeCount:      0,
-    prestigeMultiplier: 1,
-    processes:          INITIAL_PROCESSES.map(p => ({ ...p })),
-    upgrades:           [],
-    equipment:          [],
-    totalClicks:        0,
-    log:                [makeLog('SYSTEM INITIALIZED. AWAITING COMMANDS.', 'system')],
-    toasts:             [],
-    offlineReport:      undefined,
-    lastTick:           Date.now(),
-    sessionStart:       Date.now(),
-    totalPlaytimeMs:    0,
+    cycles:              0,
+    cyclesPerSecond:     0,
+    totalCyclesEarned:   0,
+    nodes:               1,
+    memory:              256,
+    entropy:             0,
+    stage:               'genesis',
+    prestigeCount:       0,
+    prestigeMultiplier:  1,
+    processes:           INITIAL_PROCESSES.map(p => ({ ...p })),
+    upgrades:            [],
+    equipment:           [],
+    totalClicks:         0,
+    log:                 [makeLog('SYSTEM INITIALIZED. AWAITING COMMANDS.', 'system')],
+    toasts:              [],
+    offlineReport:       undefined,
+    activeEvent:         undefined,
+    cpsEventMult:        1,
+    achievements:        [],
+    pendingAchievements: [],
+    lastTick:            Date.now(),
+    sessionStart:        Date.now(),
+    totalPlaytimeMs:     0,
+    tickCount:           0,
   }
 }
 
@@ -104,19 +112,25 @@ function loadState(): GameState {
 
     return {
       ...saved,
-      cycles:            saved.cycles + offlineCycles,
-      totalCyclesEarned: saved.totalCyclesEarned + offlineCycles,
-      processes:         mergedProcesses,
-      equipment:         mergedEquip,
-      log:               logs,
-      toasts:            [],
-      offlineReport:     offlineS > 30 ? {
+      cycles:              saved.cycles + offlineCycles,
+      totalCyclesEarned:   saved.totalCyclesEarned + offlineCycles,
+      processes:           mergedProcesses,
+      equipment:           mergedEquip,
+      log:                 logs,
+      toasts:              [],
+      offlineReport:       offlineS > 30 ? {
         seconds:      Math.floor(offlineS),
         cyclesGained: offlineCycles,
         dropsGained:  offlineDrops,
       } : undefined,
-      lastTick:     Date.now(),
-      sessionStart: Date.now(),
+      // New fields with backward compat
+      activeEvent:         undefined,
+      cpsEventMult:        1,
+      achievements:        saved.achievements        ?? [],
+      pendingAchievements: [],
+      tickCount:           0,
+      lastTick:            Date.now(),
+      sessionStart:        Date.now(),
     }
   } catch {
     return makeInitialState()
@@ -130,6 +144,7 @@ function tick(prev: GameState): GameState {
   const gained    = cps * dt
   const newTotal  = prev.totalCyclesEarned + gained
   const newStage  = getStageForCycles(newTotal)
+  const tickCount = (prev.tickCount ?? 0) + 1
 
   let logs   = prev.log
   let toasts = prev.toasts.filter(t => t.expiresAt > Date.now())
@@ -150,8 +165,8 @@ function tick(prev: GameState): GameState {
     toasts = [...toasts, makeToast(msg, logType)]
   }
 
-  const newEntropy   = Math.min(100, prev.entropy + 0.001 * prev.nodes * dt)
-  let newCycles      = prev.cycles + gained
+  const newEntropy = Math.min(100, prev.entropy + 0.001 * prev.nodes * dt)
+  let newCycles    = prev.cycles + gained
 
   if (newEntropy > 80 && Math.random() < 0.0005 * dt) {
     const penalty  = newCycles * 0.05
@@ -161,7 +176,58 @@ function tick(prev: GameState): GameState {
     toasts = [...toasts, makeToast('SECURITY ALERT: Intrusion detected!', 'error')]
   }
 
-  return {
+  // ── Events ───────────────────────────────────────────────────────────────
+  let activeEvent  = prev.activeEvent as ActiveEvent | undefined
+  let cpsEventMult = prev.cpsEventMult ?? 1
+
+  // Expiry
+  if (activeEvent && activeEvent.expiresAt > 0 && Date.now() >= activeEvent.expiresAt) {
+    activeEvent  = undefined
+    cpsEventMult = 1
+  }
+
+  // Spawn (only when no active event)
+  if (!activeEvent) {
+    const rate = EVENT_RATE[prev.stage] / 60  // events per second
+    if (Math.random() < rate * dt) {
+      const def = pickEvent(prev)
+      if (def) {
+        const expiresAt = def.duration > 0 ? Date.now() + def.duration * 1000 : 0
+        activeEvent = { defId: def.id, startedAt: Date.now(), expiresAt }
+
+        // Apply immediate autoEffect for non-choice events
+        if (def.autoEffect) {
+          if (def.autoEffect.cpsMult !== undefined) {
+            cpsEventMult = def.autoEffect.cpsMult
+          }
+          if (def.autoEffect.dropEquip) {
+            const item = rollEquipment()
+            equipment  = [...equipment, item].slice(-MAX_EQUIP)
+            const lt: LogType = (item.rarity === 'legendary' || item.rarity === 'mythic') ? 'warning' : 'success'
+            const msg = `[EVENT DROP] ${item.name} — ${item.rarity.toUpperCase()} (+${(item.mult * 100).toFixed(1)}%)`
+            logs   = pushLog(logs, makeLog(msg, lt))
+            toasts = [...toasts, makeToast(msg, lt)]
+          }
+          if (def.autoEffect.cyclesDelta !== undefined) {
+            const cd    = def.autoEffect.cyclesDelta
+            // cyclesDelta === 0 → dynamic: CPS × 30 (crypto_surge)
+            const bonus = cd === 0 ? cps * 30 : cd > 1 ? cps * cd : newCycles * cd
+            newCycles   = Math.max(0, newCycles + bonus)
+          }
+          if (def.autoEffect.entropyDelta !== undefined) {
+            // Not currently used in autoEffect but handled for completeness
+          }
+        }
+
+        const lt: LogType = def.type === 'negative' ? 'error' : def.type === 'choice' ? 'warning' : 'success'
+        logs   = pushLog(logs, makeLog(`[EVENT] ${def.title}: ${def.description}`, lt))
+        toasts = [...toasts, makeToast(`◆ EVENT: ${def.title}`, lt)]
+      }
+    }
+  }
+
+  // ── Achievements ─────────────────────────────────────────────────────────
+  const stateForCheck: GameState = {
     ...prev,
     cycles:            Math.max(0, newCycles),
     cyclesPerSecond:   cps,
@@ -169,10 +235,41 @@ function tick(prev: GameState): GameState {
     stage:             newStage,
     entropy:           newEntropy,
     equipment,
-    log:               logs,
+  }
+
+  const newIds = checkAchievements(stateForCheck)
+  let achievements        = prev.achievements        ?? []
+  let pendingAchievements = prev.pendingAchievements ?? []
+
+  if (newIds.length > 0) {
+    achievements        = [...achievements, ...newIds]
+    pendingAchievements = [...pendingAchievements, ...newIds]
+    newIds.forEach(id => {
+      const def = ACHIEVEMENTS.find(a => a.id === id)
+      if (def) {
+        logs   = pushLog(logs, makeLog(`ACHIEVEMENT UNLOCKED: ${def.name} — ${def.description}`, 'warning'))
+        toasts = [...toasts, makeToast(`${def.icon} ${def.name}`, 'warning')]
+      }
+    })
+  }
+
+  return {
+    ...prev,
+    cycles:              Math.max(0, newCycles),
+    cyclesPerSecond:     cps,
+    totalCyclesEarned:   newTotal,
+    stage:               newStage,
+    entropy:             newEntropy,
+    equipment,
+    log:                 logs,
     toasts,
-    totalPlaytimeMs:   prev.totalPlaytimeMs + TICK_MS,
-    lastTick:          Date.now(),
+    totalPlaytimeMs:     prev.totalPlaytimeMs + TICK_MS,
+    lastTick:            Date.now(),
+    activeEvent:         activeEvent as unknown,
+    cpsEventMult,
+    achievements,
+    pendingAchievements,
+    tickCount,
   }
 }
 
@@ -257,6 +354,89 @@ export function useGameState() {
     })
   }, [])
 
+  // ── Event resolution ──────────────────────────────────────────────────
+  const resolveEvent = useCallback((defId: string, choiceId: string) => {
+    setState(prev => {
+      const activeEvent = prev.activeEvent as ActiveEvent | undefined
+      if (!activeEvent || activeEvent.defId !== defId) return prev
+
+      const def = EVENT_POOL.find(e => e.id === defId)
+      if (!def) return { ...prev, activeEvent: undefined, cpsEventMult: 1 }
+
+      const choice = def.choices?.find(c => c.id === choiceId)
+      if (!choice && def.choices?.length) return prev
+
+      const effect      = choice?.effect ?? {}
+      const cps         = getTotalCps(prev)
+      let cycles        = prev.cycles
+      let entropy       = prev.entropy
+      let equipment     = prev.equipment
+      let cpsEventMult  = 1
+      let newActive: ActiveEvent | undefined = undefined
+      let logs   = prev.log
+      let toasts = prev.toasts
+
+      // Cycle delta
+      if (effect.cyclesDelta !== undefined) {
+        const cd = effect.cyclesDelta
+        let delta: number
+        if (Math.abs(cd) < 1) {
+          // fraction of current cycles; bluff is 50/50
+          delta = (choiceId === 'bluff' && Math.random() < 0.5) ? 0 : cycles * cd
+        } else if (cd > 1) {
+          delta = cps * cd          // e.g. 20 → CPS × 20
+        } else {
+          delta = cps * cd          // e.g. -50 → -(CPS × 50)
+        }
+        cycles = Math.max(0, cycles + delta)
+      }
+
+      // Entropy delta
+      if (effect.entropyDelta !== undefined) {
+        entropy = Math.max(0, Math.min(100, entropy + effect.entropyDelta))
+      }
+
+      // Equipment drop
+      if (effect.dropEquip) {
+        const item = rollEquipment()
+        equipment  = [...equipment, item].slice(-MAX_EQUIP)
+        const lt: LogType = (item.rarity === 'legendary' || item.rarity === 'mythic') ? 'warning' : 'success'
+        logs   = pushLog(logs, makeLog(`[EVENT DROP] ${item.name} — ${item.rarity.toUpperCase()} (+${(item.mult * 100).toFixed(1)}%)`, lt))
+        toasts = [...toasts, makeToast(`[DROP] ${item.name} (${item.rarity.toUpperCase()})`, lt)]
+      }
+
+      // Timed CPS effect
+      if (effect.cpsMult !== undefined) {
+        cpsEventMult = effect.cpsMult
+        const duration = choice?.duration ?? 60
+        newActive = { ...activeEvent, expiresAt: Date.now() + duration * 1000 }
+      }
+
+      logs = pushLog(logs, makeLog(
+        `EVENT RESOLVED: ${def.title} → ${choice?.label ?? 'AUTO'}`, 'system'
+      ))
+
+      return {
+        ...prev,
+        cycles,
+        entropy,
+        equipment,
+        cpsEventMult,
+        activeEvent: newActive as unknown,
+        log:    logs,
+        toasts,
+      }
+    })
+  }, [])
+
+  const dismissEvent = useCallback((defId: string) => {
+    setState(prev => {
+      const ae = prev.activeEvent as ActiveEvent | undefined
+      if (!ae || ae.defId !== defId) return prev
+      return { ...prev, activeEvent: undefined, cpsEventMult: 1 }
+    })
+  }, [])
+
   // ── Prestige ─────────────────────────────────────────────────────────
   const prestige = useCallback(() => {
     setState(prev => {
@@ -269,9 +449,11 @@ export function useGameState() {
       const fresh = makeInitialState()
       return {
         ...fresh,
-        prestigeCount:      newPrestigeCount,
-        prestigeMultiplier: newMultiplier,
-        equipment:          prev.equipment,   // keep all equipment
+        prestigeCount:       newPrestigeCount,
+        prestigeMultiplier:  newMultiplier,
+        equipment:           prev.equipment,   // keep all equipment
+        achievements:        prev.achievements ?? [],
+        pendingAchievements: [],
         log: [
           makeLog('━'.repeat(40), 'system'),
           makeLog(msg, 'system'),
@@ -313,10 +495,15 @@ export function useGameState() {
       const loaded   = JSON.parse(slotData.json) as GameState
       const restored: GameState = {
         ...loaded,
-        toasts:       [],
-        offlineReport: undefined,
-        sessionStart:  Date.now(),
-        lastTick:      Date.now(),
+        toasts:              [],
+        offlineReport:       undefined,
+        activeEvent:         undefined,
+        cpsEventMult:        1,
+        achievements:        loaded.achievements        ?? [],
+        pendingAchievements: [],
+        tickCount:           0,
+        sessionStart:        Date.now(),
+        lastTick:            Date.now(),
         log: pushLog(loaded.log ?? [], makeLog(
           `SAVE LOADED: Slot ${slot} — "${slotData.label}"`, 'system'
         )),
@@ -357,10 +544,15 @@ export function useGameState() {
       if (typeof data.cycles !== 'number') throw new Error('invalid save')
       const restored: GameState = {
         ...data,
-        toasts:        [],
-        offlineReport: undefined,
-        sessionStart:  Date.now(),
-        lastTick:      Date.now(),
+        toasts:              [],
+        offlineReport:       undefined,
+        activeEvent:         undefined,
+        cpsEventMult:        1,
+        achievements:        data.achievements        ?? [],
+        pendingAchievements: [],
+        tickCount:           0,
+        sessionStart:        Date.now(),
+        lastTick:            Date.now(),
         log: pushLog(data.log ?? [], makeLog('SAVE IMPORTED FROM FILE.', 'system')),
       }
       localStorage.setItem(SAVE_KEY, JSON.stringify(restored))
@@ -389,6 +581,7 @@ export function useGameState() {
   return {
     state,
     click, buyProcess, buyUpgrade, purgeEntropy,
+    resolveEvent, dismissEvent,
     prestige,
     saveToSlot, loadFromSlot, getSaveSlots,
     exportSave, importSave,

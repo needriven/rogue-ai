@@ -1,5 +1,7 @@
 import { useRef, useEffect, useState, useCallback } from 'react'
 import { useGameState } from '@/hooks/useGameState'
+import EventBanner from '@/components/EventBanner'
+import type { ActiveEvent } from '@/types/events'
 import {
   formatCycles,
   getProcessCost,
@@ -379,7 +381,10 @@ function stageProgress(stage: Stage, total: number): number {
 
 // ── Game page ──────────────────────────────────────────────────────────────
 export default function Game() {
-  const { state, click, buyProcess, buyUpgrade, purgeEntropy, prestige, dismissToast } = useGameState()
+  const {
+    state, click, buyProcess, buyUpgrade, purgeEntropy, prestige,
+    resolveEvent, dismissEvent, dismissToast,
+  } = useGameState()
   const [tab, setTab]       = useState<Tab>('processes')
   const [floats, setFloats] = useState<FloatItem[]>([])
   const btnRef              = useRef<HTMLDivElement>(null)
@@ -456,6 +461,16 @@ export default function Game() {
           <span className="tabular-nums text-t-dim w-9 text-right">{pct.toFixed(1)}%</span>
         </div>
       </div>
+
+      {/* ── Event banner ───────────────────────────────────────────── */}
+      {!!state.activeEvent && (
+        <EventBanner
+          event={state.activeEvent as ActiveEvent}
+          cps={state.cyclesPerSecond}
+          onChoice={resolveEvent}
+          onDismiss={dismissEvent}
+        />
+      )}
 
       {/* ── Main 3-column grid ─────────────────────────────────────── */}
       <div className="flex-1 min-h-0 grid" style={{ gridTemplateColumns: '210px 1fr 260px' }}>

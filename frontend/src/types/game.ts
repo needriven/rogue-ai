@@ -109,9 +109,16 @@ export interface GameState {
   toasts: Toast[]
   offlineReport?: OfflineReport
 
+  // events & achievements (imported types kept separate to avoid circular)
+  activeEvent?: unknown
+  cpsEventMult: number          // temporary CPS multiplier from active event
+  achievements: string[]
+  pendingAchievements: string[] // newly unlocked, cleared after toast shown
+
   lastTick: number
   sessionStart: number
   totalPlaytimeMs: number
+  tickCount: number             // for periodic event checks
 }
 
 // ── Static data ───────────────────────────────────────────────────────────
@@ -489,7 +496,7 @@ export function getTotalCps(state: GameState): number {
     return sum + cps * pMult
   }, 0)
 
-  return processCps * allMult * equipMult * state.prestigeMultiplier
+  return processCps * allMult * equipMult * (state.cpsEventMult ?? 1) * state.prestigeMultiplier
 }
 
 export function getClickPower(state: GameState): number {
