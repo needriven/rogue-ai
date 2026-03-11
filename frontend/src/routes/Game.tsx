@@ -379,7 +379,7 @@ function stageProgress(stage: Stage, total: number): number {
 
 // ── Game page ──────────────────────────────────────────────────────────────
 export default function Game() {
-  const { state, click, buyProcess, buyUpgrade, purgeEntropy, dismissToast } = useGameState()
+  const { state, click, buyProcess, buyUpgrade, purgeEntropy, prestige, dismissToast } = useGameState()
   const [tab, setTab]       = useState<Tab>('processes')
   const [floats, setFloats] = useState<FloatItem[]>([])
   const btnRef              = useRef<HTMLDivElement>(null)
@@ -434,6 +434,19 @@ export default function Game() {
             <span>MULT: <span className="text-t-amber">×{allMult.toFixed(1)}</span></span>
           </>
         )}
+
+        {/* Prestige button — only at Singularity */}
+        {state.stage === 'singularity' && (
+          <button
+            onClick={prestige}
+            className="ml-4 text-xs px-3 py-1 border border-purple-500 text-purple-400
+                       hover:bg-purple-900/30 transition-all duration-150 tracking-widest
+                       animate-glow-pulse"
+          >
+            ⟳ PRESTIGE (×{(state.prestigeMultiplier * 1.5).toFixed(2)})
+          </button>
+        )}
+
         <div className="ml-auto flex items-center gap-2">
           <span className="text-t-muted">NEXT:</span>
           <div className="w-20 h-1 bg-t-muted overflow-hidden">

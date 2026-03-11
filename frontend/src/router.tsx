@@ -1,13 +1,9 @@
-import {
-  createRouter,
-  createRootRoute,
-  createRoute,
-} from '@tanstack/react-router'
-import Root from '@/routes/Root'
-import Home from '@/routes/Home'
-import Game from '@/routes/Game'
+import { createRouter, createRootRoute, createRoute } from '@tanstack/react-router'
+import Root     from '@/routes/Root'
+import Home     from '@/routes/Home'
+import Game     from '@/routes/Game'
+import Settings from '@/routes/Settings'
 
-// ── Routes ─────────────────────────────────────────────────────────────────
 export const rootRoute = createRootRoute({ component: Root })
 
 export const homeRoute = createRoute({
@@ -22,17 +18,16 @@ export const gameRoute = createRoute({
   component: Game,
 })
 
-// ── Router ─────────────────────────────────────────────────────────────────
-const routeTree = rootRoute.addChildren([homeRoute, gameRoute])
-
-export const router = createRouter({
-  routeTree,
-  defaultPreload: 'intent',
+export const settingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/settings',
+  component: Settings,
 })
 
-// ── Type registration ──────────────────────────────────────────────────────
+const routeTree = rootRoute.addChildren([homeRoute, gameRoute, settingsRoute])
+
+export const router = createRouter({ routeTree, defaultPreload: 'intent' })
+
 declare module '@tanstack/react-router' {
-  interface Register {
-    router: typeof router
-  }
+  interface Register { router: typeof router }
 }

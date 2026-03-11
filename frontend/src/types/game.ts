@@ -69,6 +69,22 @@ export interface Toast {
   expiresAt: number
 }
 
+export interface OfflineReport {
+  seconds:      number
+  cyclesGained: number
+  dropsGained:  Equipment[]
+}
+
+export interface SaveSlot {
+  slot:              1 | 2 | 3
+  label:             string
+  timestamp:         number
+  stage:             Stage
+  totalCyclesEarned: number
+  prestigeCount:     number
+  json:              string
+}
+
 // ── Full game state ────────────────────────────────────────────────────────
 
 export interface GameState {
@@ -91,6 +107,7 @@ export interface GameState {
   totalClicks: number
   log: LogEntry[]
   toasts: Toast[]
+  offlineReport?: OfflineReport
 
   lastTick: number
   sessionStart: number
@@ -506,6 +523,12 @@ export function isUpgradeUnlocked(u: Upgrade, state: GameState): boolean {
     if (!p || p.count < u.unlockProcess.count) return false
   }
   return true
+}
+
+// Simulate N drops probabilistically (Poisson-like)
+export function simulateDrops(expected: number, cap = 10): Equipment[] {
+  const count = Math.min(cap, Math.floor(expected) + (Math.random() < (expected % 1) ? 1 : 0))
+  return Array.from({ length: count }, () => rollEquipment())
 }
 
 // Drop rate per second, scales with nodes + stage
