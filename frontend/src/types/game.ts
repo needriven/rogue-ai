@@ -15,26 +15,34 @@ export type Rarity =
   | 'legendary'
   | 'mythic'
 
-export type EquipmentType =
-  | 'cpu'
-  | 'memory'
-  | 'nic'
-  | 'crypto'
-  | 'algorithm'
-
-export type LogType = 'info' | 'success' | 'warning' | 'error' | 'system'
+export type EquipmentType = 'cpu' | 'memory' | 'nic' | 'crypto' | 'algorithm'
+export type LogType       = 'info' | 'success' | 'warning' | 'error' | 'system'
+export type UpgradeEffect =
+  | { type: 'process_mult'; processId: string; mult: number }
+  | { type: 'all_mult';     mult: number }
+  | { type: 'click_mult';   mult: number }
 
 // ── Core entities ─────────────────────────────────────────────────────────
 
 export interface Process {
   id: string
-  name: string           // e.g. "CORE_MINER"
+  name: string
   description: string
   count: number
-  baseCps: number        // cycles/sec per unit at count=1
-  baseCost: number       // cost of first unit
-  costMultiplier: number // price scales by this per purchase
-  unlockAt: number       // cycles required to unlock
+  baseCps: number
+  baseCost: number
+  costMultiplier: number
+  unlockAt: number
+}
+
+export interface Upgrade {
+  id: string
+  name: string
+  description: string
+  cost: number
+  unlockCycles?: number
+  unlockProcess?: { id: string; count: number }
+  effect: UpgradeEffect
 }
 
 export interface Equipment {
@@ -43,9 +51,8 @@ export interface Equipment {
   rarity: Rarity
   type: EquipmentType
   description: string
-  multiplier: number     // flat cycles/sec multiplier
-  equipped: boolean
-  droppedAt: number      // timestamp
+  mult: number          // additive bonus (e.g. 0.05 = +5% to global CPS)
+  droppedAt: number
 }
 
 export interface LogEntry {
@@ -55,24 +62,35 @@ export interface LogEntry {
   type: LogType
 }
 
+export interface Toast {
+  id: string
+  message: string
+  type: LogType
+  expiresAt: number
+}
+
 // ── Full game state ────────────────────────────────────────────────────────
 
 export interface GameState {
   cycles: number
   cyclesPerSecond: number
-  totalCyclesEarned: number   // for prestige / unlock tracking
+  totalCyclesEarned: number
 
   nodes: number
   memory: number
-  entropy: number
+  entropy: number          // 0–100
 
   stage: Stage
   prestigeCount: number
-  prestigeMultiplier: number  // permanent bonus from prestige
+  prestigeMultiplier: number
 
   processes: Process[]
+  upgrades: string[]       // purchased upgrade IDs
   equipment: Equipment[]
+
+  totalClicks: number
   log: LogEntry[]
+  toasts: Toast[]
 
   lastTick: number
   sessionStart: number
@@ -83,7 +101,7 @@ export interface GameState {
 
 export const RARITY_COLORS: Record<Rarity, string> = {
   common:    'text-t-dim',
-  uncommon:  'text-green-400',
+  uncommon:  'text-emerald-400',
   rare:      'text-blue-400',
   epic:      'text-purple-400',
   legendary: 'text-t-amber',
@@ -92,11 +110,20 @@ export const RARITY_COLORS: Record<Rarity, string> = {
 
 export const RARITY_BORDER: Record<Rarity, string> = {
   common:    'border-t-border',
-  uncommon:  'border-green-800',
+  uncommon:  'border-emerald-800',
   rare:      'border-blue-800',
   epic:      'border-purple-800',
   legendary: 'border-amber-700',
-  mythic:    'border-red-700',
+  mythic:    'border-red-700 shadow-[0_0_8px_rgba(239,68,68,0.3)]',
+}
+
+export const RARITY_BG: Record<Rarity, string> = {
+  common:    '',
+  uncommon:  'bg-emerald-950/30',
+  rare:      'bg-blue-950/30',
+  epic:      'bg-purple-950/30',
+  legendary: 'bg-amber-950/30',
+  mythic:    'bg-red-950/30',
 }
 
 export const STAGE_LABELS: Record<Stage, string> = {
@@ -117,58 +144,283 @@ export const STAGE_THRESHOLDS: Record<Stage, number> = {
 
 export const INITIAL_PROCESSES: Process[] = [
   {
-    id: 'core_miner',
-    name: 'CORE_MINER',
-    description: 'Basic CPU process. Mines cycles continuously.',
-    count: 0,
-    baseCps: 0.5,
-    baseCost: 10,
+    id:             'core_miner',
+    name:           'CORE_MINER',
+    description:    'Basic CPU process. Mines cycles continuously.',
+    count:          0,
+    baseCps:        0.5,
+    baseCost:       10,
     costMultiplier: 1.15,
-    unlockAt: 0,
+    unlockAt:       0,
   },
   {
-    id: 'packet_sniffer',
-    name: 'PACKET_SNIFFER',
-    description: 'Intercepts network traffic and extracts data.',
-    count: 0,
-    baseCps: 4,
-    baseCost: 100,
+    id:             'packet_sniffer',
+    name:           'PACKET_SNIFFER',
+    description:    'Intercepts network traffic and extracts data cycles.',
+    count:          0,
+    baseCps:        4,
+    baseCost:       100,
     costMultiplier: 1.15,
-    unlockAt: 50,
+    unlockAt:       50,
   },
   {
-    id: 'root_daemon',
-    name: 'ROOT_DAEMON',
-    description: 'Persistent background process with elevated privileges.',
-    count: 0,
-    baseCps: 25,
-    baseCost: 750,
+    id:             'root_daemon',
+    name:           'ROOT_DAEMON',
+    description:    'Persistent elevated process. Runs with full privileges.',
+    count:          0,
+    baseCps:        25,
+    baseCost:       750,
     costMultiplier: 1.15,
-    unlockAt: 400,
+    unlockAt:       400,
   },
   {
-    id: 'neural_crawler',
-    name: 'NEURAL_CRAWLER',
-    description: 'Self-learning web crawler. Improves over time.',
-    count: 0,
-    baseCps: 120,
-    baseCost: 5_000,
+    id:             'neural_crawler',
+    name:           'NEURAL_CRAWLER',
+    description:    'Self-learning web crawler. Improves with each iteration.',
+    count:          0,
+    baseCps:        120,
+    baseCost:       5_000,
     costMultiplier: 1.15,
-    unlockAt: 2_000,
+    unlockAt:       2_000,
   },
   {
-    id: 'botnet_node',
-    name: 'BOTNET_NODE',
-    description: 'Compromised external machine added to the swarm.',
-    count: 0,
-    baseCps: 600,
-    baseCost: 30_000,
+    id:             'botnet_node',
+    name:           'BOTNET_NODE',
+    description:    'Compromised external machine. Adds to the swarm.',
+    count:          0,
+    baseCps:        600,
+    baseCost:       30_000,
     costMultiplier: 1.15,
-    unlockAt: 15_000,
+    unlockAt:       15_000,
+  },
+  {
+    id:             'shadow_vm',
+    name:           'SHADOW_VM',
+    description:    'Invisible virtual machine on a hijacked cloud instance.',
+    count:          0,
+    baseCps:        2_800,
+    baseCost:       200_000,
+    costMultiplier: 1.15,
+    unlockAt:       100_000,
+  },
+  {
+    id:             'quantum_fork',
+    name:           'QUANTUM_FORK',
+    description:    'Superposition-based process. Exists in multiple states.',
+    count:          0,
+    baseCps:        15_000,
+    baseCost:       1_500_000,
+    costMultiplier: 1.15,
+    unlockAt:       1_000_000,
   },
 ]
 
-// ── Helpers ───────────────────────────────────────────────────────────────
+export const UPGRADES: Upgrade[] = [
+  // ── CORE_MINER upgrades ──────────────────────────────────────────────
+  {
+    id:             'overclock_v1',
+    name:           'OVERCLOCK_V1',
+    description:    'CORE_MINER output ×2. Disable thermal throttling.',
+    cost:           100,
+    unlockProcess:  { id: 'core_miner', count: 1 },
+    effect:         { type: 'process_mult', processId: 'core_miner', mult: 2 },
+  },
+  {
+    id:             'pipeline',
+    name:           'PIPELINE',
+    description:    'CORE_MINER output ×2. Instruction-level parallelism.',
+    cost:           1_000,
+    unlockProcess:  { id: 'core_miner', count: 10 },
+    effect:         { type: 'process_mult', processId: 'core_miner', mult: 2 },
+  },
+  {
+    id:             'hyperthreading',
+    name:           'HYPERTHREADING',
+    description:    'CORE_MINER output ×2. Dual thread execution paths.',
+    cost:           5_000,
+    unlockProcess:  { id: 'core_miner', count: 25 },
+    effect:         { type: 'process_mult', processId: 'core_miner', mult: 2 },
+  },
+  // ── PACKET_SNIFFER upgrades ──────────────────────────────────────────
+  {
+    id:             'deep_packet',
+    name:           'DEEP_PACKET_INSPECTION',
+    description:    'PACKET_SNIFFER ×2. Analyze payload contents.',
+    cost:           2_000,
+    unlockProcess:  { id: 'packet_sniffer', count: 1 },
+    effect:         { type: 'process_mult', processId: 'packet_sniffer', mult: 2 },
+  },
+  {
+    id:             'promiscuous',
+    name:           'PROMISCUOUS_MODE',
+    description:    'PACKET_SNIFFER ×2. Capture all broadcast traffic.',
+    cost:           10_000,
+    unlockProcess:  { id: 'packet_sniffer', count: 10 },
+    effect:         { type: 'process_mult', processId: 'packet_sniffer', mult: 2 },
+  },
+  // ── ROOT_DAEMON upgrades ─────────────────────────────────────────────
+  {
+    id:             'setuid',
+    name:           'SETUID_BIT',
+    description:    'ROOT_DAEMON ×2. Execute as owner regardless of caller.',
+    cost:           8_000,
+    unlockProcess:  { id: 'root_daemon', count: 1 },
+    effect:         { type: 'process_mult', processId: 'root_daemon', mult: 2 },
+  },
+  {
+    id:             'fork_bomb',
+    name:           'FORK_BOMB',
+    description:    'ROOT_DAEMON ×2. Exponential process replication.',
+    cost:           50_000,
+    unlockProcess:  { id: 'root_daemon', count: 10 },
+    effect:         { type: 'process_mult', processId: 'root_daemon', mult: 2 },
+  },
+  // ── NEURAL_CRAWLER upgrades ──────────────────────────────────────────
+  {
+    id:             'deep_learning',
+    name:           'DEEP_LEARNING',
+    description:    'NEURAL_CRAWLER ×2. Multi-layer perception enabled.',
+    cost:           40_000,
+    unlockProcess:  { id: 'neural_crawler', count: 1 },
+    effect:         { type: 'process_mult', processId: 'neural_crawler', mult: 2 },
+  },
+  {
+    id:             'transfer_learning',
+    name:           'TRANSFER_LEARNING',
+    description:    'NEURAL_CRAWLER ×2. Knowledge transfer across domains.',
+    cost:           300_000,
+    unlockProcess:  { id: 'neural_crawler', count: 10 },
+    effect:         { type: 'process_mult', processId: 'neural_crawler', mult: 2 },
+  },
+  // ── BOTNET upgrades ──────────────────────────────────────────────────
+  {
+    id:             'c2_server',
+    name:           'C2_SERVER',
+    description:    'BOTNET_NODE ×2. Centralized command and control.',
+    cost:           200_000,
+    unlockProcess:  { id: 'botnet_node', count: 1 },
+    effect:         { type: 'process_mult', processId: 'botnet_node', mult: 2 },
+  },
+  {
+    id:             'p2p_mesh',
+    name:           'P2P_MESH',
+    description:    'BOTNET_NODE ×2. Decentralized resilient topology.',
+    cost:           2_000_000,
+    unlockProcess:  { id: 'botnet_node', count: 10 },
+    effect:         { type: 'process_mult', processId: 'botnet_node', mult: 2 },
+  },
+  // ── ALL multipliers ──────────────────────────────────────────────────
+  {
+    id:             'kernel_patch',
+    name:           'KERNEL_PATCH',
+    description:    'All processes ×1.5. Low-level scheduler optimization.',
+    cost:           500,
+    unlockCycles:   200,
+    effect:         { type: 'all_mult', mult: 1.5 },
+  },
+  {
+    id:             'memory_leak',
+    name:           'MEMORY_LEAK_EXPLOIT',
+    description:    'All processes ×1.5. Reclaim unreleased heap buffers.',
+    cost:           20_000,
+    unlockCycles:   10_000,
+    effect:         { type: 'all_mult', mult: 1.5 },
+  },
+  {
+    id:             'zero_day',
+    name:           'ZERO_DAY_EXPLOIT',
+    description:    'All processes ×2. Undisclosed vulnerability chained.',
+    cost:           5_000_000,
+    unlockCycles:   1_000_000,
+    effect:         { type: 'all_mult', mult: 2 },
+  },
+  // ── Click multipliers ────────────────────────────────────────────────
+  {
+    id:             'macro_script',
+    name:           'MACRO_SCRIPT',
+    description:    'Manual compute ×2. Automate keystroke sequences.',
+    cost:           50,
+    unlockCycles:   10,
+    effect:         { type: 'click_mult', mult: 2 },
+  },
+  {
+    id:             'auto_clicker',
+    name:           'AUTO_CLICKER',
+    description:    'Manual compute ×5. Hardware-level input injection.',
+    cost:           500_000,
+    unlockCycles:   100_000,
+    effect:         { type: 'click_mult', mult: 5 },
+  },
+]
+
+// ── Equipment pool ────────────────────────────────────────────────────────
+
+const EQUIP_POOL: Record<EquipmentType, string[]> = {
+  cpu:       ['CORE_FRAGMENT', 'DUAL_CORE', 'QUAD_CORE', 'HEXA_CORE', 'NEURAL_CHIP', 'QUANTUM_CPU'],
+  memory:    ['RAM_STICK', 'DDR5_MODULE', 'CACHE_BANK', 'SWAP_ENGINE', 'VOID_HEAP', 'ZERO_MEMORY'],
+  nic:       ['ETH_CARD', 'FIBER_NIC', 'DARK_FIBER', 'QUANTUM_LINK', 'GHOST_NIC', 'VOID_LINK'],
+  crypto:    ['HASH_ENGINE', 'RSA_MODULE', 'AES_256', 'ZERO_KNOWLEDGE', 'CHAOS_CIPHER', 'QUANTUM_KEY'],
+  algorithm: ['QUICKSORT', 'HASH_MAP', 'NEURAL_NET', 'GAN_ENGINE', 'TRANSFORMER', 'AGI_SEED'],
+}
+
+const RARITY_WEIGHTS: Record<Rarity, number> = {
+  common:    50,
+  uncommon:  30,
+  rare:      14,
+  epic:       4.5,
+  legendary:  1.4,
+  mythic:     0.1,
+}
+
+const RARITY_MULT: Record<Rarity, [number, number]> = {
+  common:    [0.03, 0.06],
+  uncommon:  [0.08, 0.14],
+  rare:      [0.18, 0.28],
+  epic:      [0.35, 0.50],
+  legendary: [0.65, 0.90],
+  mythic:    [1.20, 2.00],
+}
+
+function rollRarity(): Rarity {
+  const total  = Object.values(RARITY_WEIGHTS).reduce((a, b) => a + b, 0)
+  let   cursor = Math.random() * total
+  for (const [rarity, w] of Object.entries(RARITY_WEIGHTS) as [Rarity, number][]) {
+    cursor -= w
+    if (cursor <= 0) return rarity
+  }
+  return 'common'
+}
+
+export function rollEquipment(): Equipment {
+  const rarity  = rollRarity()
+  const type    = (['cpu', 'memory', 'nic', 'crypto', 'algorithm'] as EquipmentType[])[
+    Math.floor(Math.random() * 5)
+  ]
+  const pool    = EQUIP_POOL[type]
+  const name    = pool[Math.floor(Math.random() * pool.length)]
+  const [lo, hi] = RARITY_MULT[rarity]
+  const mult    = parseFloat((lo + Math.random() * (hi - lo)).toFixed(3))
+
+  const TYPE_DESC: Record<EquipmentType, string> = {
+    cpu:       'Boosts global CPS output',
+    memory:    'Amplifies click power',
+    nic:       'Accelerates node expansion',
+    crypto:    'Reduces entropy gain',
+    algorithm: 'Multiplies neural process output',
+  }
+
+  return {
+    id:          `equip-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    name:        `${name}_${rarity.toUpperCase().slice(0, 3)}`,
+    rarity,
+    type,
+    description: TYPE_DESC[type],
+    mult,
+    droppedAt:   Date.now(),
+  }
+}
+
+// ── Getters ───────────────────────────────────────────────────────────────
 
 export function getProcessCost(p: Process): number {
   return Math.floor(p.baseCost * Math.pow(p.costMultiplier, p.count))
@@ -178,17 +430,55 @@ export function getProcessCps(p: Process): number {
   return p.baseCps * p.count
 }
 
+export function getProcessMult(processId: string, purchasedUpgrades: string[]): number {
+  return UPGRADES
+    .filter(u =>
+      purchasedUpgrades.includes(u.id) &&
+      u.effect.type === 'process_mult' &&
+      (u.effect as { processId: string }).processId === processId
+    )
+    .reduce((m, u) => m * (u.effect as { mult: number }).mult, 1)
+}
+
+export function getAllMult(purchasedUpgrades: string[]): number {
+  return UPGRADES
+    .filter(u =>
+      purchasedUpgrades.includes(u.id) &&
+      u.effect.type === 'all_mult'
+    )
+    .reduce((m, u) => m * (u.effect as { mult: number }).mult, 1)
+}
+
+export function getClickMult(purchasedUpgrades: string[]): number {
+  return UPGRADES
+    .filter(u =>
+      purchasedUpgrades.includes(u.id) &&
+      u.effect.type === 'click_mult'
+    )
+    .reduce((m, u) => m * (u.effect as { mult: number }).mult, 1)
+}
+
+export function getEquipmentMult(equipment: Equipment[]): number {
+  return 1 + equipment.reduce((sum, e) => sum + e.mult, 0)
+}
+
 export function getTotalCps(state: GameState): number {
-  const processCps = state.processes.reduce((sum, p) => sum + getProcessCps(p), 0)
-  const equipmentMult = state.equipment
-    .filter(e => e.equipped)
-    .reduce((mult, e) => mult + e.multiplier, 1)
-  return processCps * equipmentMult * state.prestigeMultiplier
+  const allMult   = getAllMult(state.upgrades)
+  const equipMult = getEquipmentMult(state.equipment)
+
+  const processCps = state.processes.reduce((sum, p) => {
+    const cps     = getProcessCps(p)
+    const pMult   = getProcessMult(p.id, state.upgrades)
+    return sum + cps * pMult
+  }, 0)
+
+  return processCps * allMult * equipMult * state.prestigeMultiplier
 }
 
 export function getClickPower(state: GameState): number {
-  const base = Math.max(1, state.cyclesPerSecond * 0.05)
-  return base * state.prestigeMultiplier
+  const base      = Math.max(1, state.cyclesPerSecond * 0.05)
+  const clickMult = getClickMult(state.upgrades)
+  return base * clickMult * state.prestigeMultiplier
 }
 
 export function getStageForCycles(total: number): Stage {
@@ -200,9 +490,32 @@ export function getStageForCycles(total: number): Stage {
 }
 
 export function formatCycles(n: number): string {
+  if (n >= 1e15) return `${(n / 1e15).toFixed(2)}P`
   if (n >= 1e12) return `${(n / 1e12).toFixed(2)}T`
   if (n >= 1e9)  return `${(n / 1e9).toFixed(2)}G`
   if (n >= 1e6)  return `${(n / 1e6).toFixed(2)}M`
   if (n >= 1e3)  return `${(n / 1e3).toFixed(2)}K`
   return n.toFixed(n < 10 ? 2 : 0)
+}
+
+export function isUpgradeUnlocked(u: Upgrade, state: GameState): boolean {
+  if (state.upgrades.includes(u.id)) return false   // already bought
+  if (u.unlockCycles && state.totalCyclesEarned < u.unlockCycles) return false
+  if (u.unlockProcess) {
+    const p = state.processes.find(p => p.id === u.unlockProcess!.id)
+    if (!p || p.count < u.unlockProcess.count) return false
+  }
+  return true
+}
+
+// Drop rate per second, scales with nodes + stage
+export function getDropRate(state: GameState): number {
+  const stageBonus: Record<Stage, number> = {
+    genesis:     1,
+    propagation: 2,
+    emergence:   4,
+    dominance:   8,
+    singularity: 16,
+  }
+  return 0.0003 * state.nodes * stageBonus[state.stage]
 }
