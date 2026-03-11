@@ -1,5 +1,7 @@
 # ── Stage 1: Build ────────────────────────────────────
-FROM node:20-alpine AS builder
+# Always build on the runner's native platform (amd64).
+# Output is pure static files — architecture-independent.
+FROM --platform=$BUILDPLATFORM node:20-alpine AS builder
 
 WORKDIR /app
 
