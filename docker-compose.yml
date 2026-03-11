@@ -1,6 +1,22 @@
 name: rogue-ai
 
 services:
+  # ── FastAPI backend ────────────────────────────────
+  api:
+    image: ghcr.io/${GITHUB_REPOSITORY:-needriven/rogue-ai}-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    volumes:
+      - api-data:/data
+    environment:
+      - DATABASE_PATH=/data/saves.db
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   # ── Production web server ──────────────────────────
   web:
     image: ghcr.io/${GITHUB_REPOSITORY:-needriven/rogue-ai}:${IMAGE_TAG:-latest}
@@ -15,6 +31,8 @@ services:
       - certbot-webroot:/var/www/certbot
     environment:
       - DOMAIN=${DOMAIN:-}
+    depends_on:
+      - api
     networks:
       - app-net
 
@@ -29,6 +47,7 @@ services:
 
 volumes:
   certbot-webroot:
+  api-data:
 
 networks:
   app-net:
