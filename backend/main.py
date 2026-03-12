@@ -9,7 +9,7 @@ from typing import Optional
 import aiosqlite
 import feedparser
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -17,8 +17,9 @@ from pydantic import BaseModel
 DATABASE_PATH  = os.environ.get("DATABASE_PATH", "./saves.db")
 MAX_SAVE_BYTES = 512 * 1024   # 512 KB
 UUID_RE        = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
-FEED_FETCH_INTERVAL = int(os.environ.get("FEED_FETCH_INTERVAL", "3600"))  # seconds
+FEED_FETCH_INTERVAL       = int(os.environ.get("FEED_FETCH_INTERVAL", "3600"))
 FEED_MAX_ITEMS_PER_SOURCE = 100
+TERM_TOKEN                = os.environ.get("TERM_TOKEN", "")   # shared secret for relay auth
 
 
 def _valid_session(session_id: str) -> bool:
@@ -384,3 +385,142 @@ async def refresh_source(source_id: int):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         n = await fetch_source(db, src["id"], src["url"])
     return {"new_items": n}
+
+
+# ── Terminal WebSocket relay ───────────────────────────────────────────────────
+#
+# Architecture:
+#   MacBook agent  ──WS──►  /ws/term/host?token=TOKEN
+#   Browser        ──WS──►  /ws/term/client?token=TOKEN
+#   OCI relay bridges the two, forwarding raw bytes in both directions.
+#
+# Only one host connection allowed at a time (single-user).
+# Browser sends UTF-8 text (terminal input) → forwarded to host as text.
+# Host sends bytes (PTY output) → forwarded to browser as bytes or text.
+
+class TermRelay:
+    def __init__(self) -> None:
+        self.host:   Optional[WebSocket] = None
+        self.client: Optional[WebSocket] = None
+        self._lock = asyncio.Lock()
+
+    def _auth(self, token: str) -> bool:
+        if not TERM_TOKEN:
+            return False          # relay disabled until TERM_TOKEN is configured
+        return token == TERM_TOKEN
+
+    async def connect_host(self, ws: WebSocket, token: str) -> bool:
+        if not self._auth(token):
+            await ws.close(code=4001, reason="unauthorized")
+            return False
+        async with self._lock:
+            if self.host is not None:
+                await ws.close(code=4002, reason="host already connected")
+                return False
+            self.host = ws
+        return True
+
+    async def connect_client(self, ws: WebSocket, token: str) -> bool:
+        if not self._auth(token):
+            await ws.close(code=4001, reason="unauthorized")
+            return False
+        async with self._lock:
+            if self.client is not None:
+                # Kick old client
+                try:
+                    await self.client.close(code=4003, reason="replaced by new client")
+                except Exception:
+                    pass
+            self.client = ws
+        return True
+
+    async def disconnect_host(self) -> None:
+        async with self._lock:
+            self.host = None
+        if self.client:
+            try:
+                await self.client.send_text("\r\n\x1b[31m[relay] host disconnected\x1b[0m\r\n")
+            except Exception:
+                pass
+
+    async def disconnect_client(self) -> None:
+        async with self._lock:
+            self.client = None
+
+    @property
+    def status(self) -> dict:
+        return {
+            "host_connected":   self.host   is not None,
+            "client_connected": self.client is not None,
+            "token_configured": bool(TERM_TOKEN),
+        }
+
+
+relay = TermRelay()
+
+
+@app.get("/api/term/status")
+async def term_status():
+    return relay.status
+
+
+@app.websocket("/ws/term/host")
+async def ws_term_host(ws: WebSocket, token: str = ""):
+    await ws.accept()
+    if not await relay.connect_host(ws, token):
+        return
+    try:
+        while True:
+            # Host sends PTY output (bytes or text) → forward to browser
+            msg = await ws.receive()
+            if relay.client is None:
+                continue
+            if "bytes" in msg and msg["bytes"]:
+                try:
+                    await relay.client.send_bytes(msg["bytes"])
+                except Exception:
+                    pass
+            elif "text" in msg and msg["text"]:
+                try:
+                    await relay.client.send_text(msg["text"])
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await relay.disconnect_host()
+
+
+@app.websocket("/ws/term/client")
+async def ws_term_client(ws: WebSocket, token: str = ""):
+    await ws.accept()
+    if not await relay.connect_client(ws, token):
+        return
+
+    # Notify browser of current host status
+    if relay.host is None:
+        await ws.send_text("\x1b[33m[relay] waiting for host agent to connect...\x1b[0m\r\n")
+    else:
+        await ws.send_text("\x1b[32m[relay] host connected. terminal ready.\x1b[0m\r\n")
+
+    try:
+        while True:
+            # Browser sends keystrokes → forward to MacBook agent
+            msg = await ws.receive()
+            if relay.host is None:
+                await ws.send_text("\x1b[33m[relay] host not connected\x1b[0m\r\n")
+                continue
+            if "bytes" in msg and msg["bytes"]:
+                try:
+                    await relay.host.send_bytes(msg["bytes"])
+                except Exception:
+                    pass
+            elif "text" in msg and msg["text"]:
+                try:
+                    await relay.host.send_text(msg["text"])
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await relay.disconnect_client()

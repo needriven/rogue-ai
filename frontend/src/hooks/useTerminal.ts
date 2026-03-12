@@ -59,6 +59,28 @@ function timeAgo(ms: number): string {
   return `${Math.floor(s / 3600)}h ago`
 }
 
+// ── Shell-like tokenizer: respects "quoted strings" and strips quotes ─────────
+function tokenize(input: string): string[] {
+  const tokens: string[] = []
+  let cur = ''
+  let inQ: '"' | "'" | null = null
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (inQ) {
+      if (ch === inQ) { inQ = null }
+      else             { cur += ch  }
+    } else if (ch === '"' || ch === "'") {
+      inQ = ch
+    } else if (ch === ' ' || ch === '\t') {
+      if (cur) { tokens.push(cur); cur = '' }
+    } else {
+      cur += ch
+    }
+  }
+  if (cur) tokens.push(cur)
+  return tokens
+}
+
 // ── Parse flags from args ─────────────────────────────────────────────────────
 // e.g. parseFlags(['--tag', 'news', '--name', 'HN']) → { tag: 'news', name: 'HN' }
 function parseFlags(args: string[]): { positional: string[]; flags: Record<string, string> } {
@@ -400,7 +422,7 @@ export function useTerminal(ctx: TerminalCtx) {
     // Echo prompt line
     addLines([line('prompt', `rogue@os:~$ ${trimmed}`)])
 
-    const [name, ...rest] = trimmed.split(/\s+/)
+    const [name, ...rest] = tokenize(trimmed)
     const def = COMMANDS[name.toLowerCase()]
     if (!def) {
       addLines([

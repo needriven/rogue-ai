@@ -9,6 +9,7 @@ services:
       - api-data:/data
     environment:
       - DATABASE_PATH=/data/saves.db
+      - TERM_TOKEN=${TERM_TOKEN:-}
     networks:
       - app-net
     healthcheck:

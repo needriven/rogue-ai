@@ -8,6 +8,7 @@ const NAV_ITEMS = [
   { to: '/',         label: 'HOME',     icon: '~',  exact: true  },
   { to: '/game',     label: 'GAME',     icon: '▶',  exact: false },
   { to: '/feed',     label: 'FEED',     icon: '◈',  exact: false },
+  { to: '/term',     label: 'TERM',     icon: '$',  exact: false },
   { to: '/settings', label: 'SETTINGS', icon: '⚙',  exact: false },
 ] as const
 
