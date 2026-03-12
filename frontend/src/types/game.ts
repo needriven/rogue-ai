@@ -119,6 +119,11 @@ export interface GameState {
   sessionStart: number
   totalPlaytimeMs: number
   tickCount: number             // for periodic event checks
+
+  // ── Stats tracking (optional for backward compat) ────────────────────
+  totalDropsByRarity?: Partial<Record<Rarity, number>>
+  totalEventsResolved?: number
+  totalEventsDismissed?: number
 }
 
 // ── Static data ───────────────────────────────────────────────────────────

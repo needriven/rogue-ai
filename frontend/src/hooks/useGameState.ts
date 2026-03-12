@@ -158,10 +158,12 @@ function tick(prev: GameState): GameState {
     toasts = [...toasts, makeToast(msg, 'system')]
   }
 
-  let equipment = prev.equipment
+  let equipment          = prev.equipment
+  let totalDropsByRarity = { ...(prev.totalDropsByRarity ?? {}) }
   if (Math.random() < getDropRate(prev) * dt) {
     const item    = rollEquipment()
     equipment     = [...equipment, item].slice(-MAX_EQUIP)
+    totalDropsByRarity[item.rarity] = (totalDropsByRarity[item.rarity] ?? 0) + 1
     const logType: LogType = (item.rarity === 'mythic' || item.rarity === 'legendary') ? 'warning' : 'success'
     const msg     = `[DROP] ${item.name} — ${item.rarity.toUpperCase()} (+${(item.mult * 100).toFixed(1)}%)`
     logs   = pushLog(logs, makeLog(msg, logType))
@@ -264,6 +266,7 @@ function tick(prev: GameState): GameState {
     stage:               newStage,
     entropy:             newEntropy,
     equipment,
+    totalDropsByRarity,
     log:                 logs,
     toasts,
     totalPlaytimeMs:     prev.totalPlaytimeMs + elapsed,
@@ -436,9 +439,10 @@ export function useGameState() {
         entropy,
         equipment,
         cpsEventMult,
-        activeEvent: newActive as unknown,
-        log:    logs,
+        activeEvent:          newActive as unknown,
+        log:                  logs,
         toasts,
+        totalEventsResolved:  (prev.totalEventsResolved ?? 0) + 1,
       }
     })
   }, [])
@@ -447,7 +451,12 @@ export function useGameState() {
     setState(prev => {
       const ae = prev.activeEvent as ActiveEvent | undefined
       if (!ae || ae.defId !== defId) return prev
-      return { ...prev, activeEvent: undefined, cpsEventMult: 1 }
+      return {
+        ...prev,
+        activeEvent:           undefined,
+        cpsEventMult:          1,
+        totalEventsDismissed:  (prev.totalEventsDismissed ?? 0) + 1,
+      }
     })
   }, [])
 

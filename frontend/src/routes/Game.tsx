@@ -2,6 +2,7 @@ import { useRef, useEffect, useState, useCallback } from 'react'
 import { useGame } from '@/context/GameContext'
 import EventBanner from '@/components/EventBanner'
 import type { ActiveEvent } from '@/types/events'
+import { ACHIEVEMENTS } from '@/types/achievements'
 import {
   formatCycles,
   getProcessCost,
@@ -9,6 +10,7 @@ import {
   getProcessMult,
   getAllMult,
   getClickMult,
+  getTotalCps,
   RARITY_COLORS,
   RARITY_BORDER,
   RARITY_BG,
@@ -18,6 +20,8 @@ import {
   isUpgradeUnlocked,
   type Process,
   type Equipment,
+  type EquipmentType,
+  type Rarity,
   type LogEntry,
   type LogType,
   type Toast,
@@ -25,7 +29,8 @@ import {
 } from '@/types/game'
 
 // ── Types ──────────────────────────────────────────────────────────────────
-type Tab = 'processes' | 'upgrades' | 'equipment'
+// Extend Tab here to add new panels (e.g. 'market' | 'network')
+type Tab = 'processes' | 'upgrades' | 'equipment' | 'stats'
 
 interface FloatItem {
   id:    string
@@ -218,11 +223,12 @@ function EntropyGauge({ value, onPurge }: { value: number; onPurge: () => void }
 }
 
 // ── Process row ────────────────────────────────────────────────────────────
-function ProcessRow({ process, cycles, upgrades, onBuy }: {
-  process: Process
-  cycles:  number
+function ProcessRow({ process, cycles, upgrades, totalCps, onBuy }: {
+  process:  Process
+  cycles:   number
   upgrades: string[]
-  onBuy:   (id: string) => void
+  totalCps: number
+  onBuy:    (id: string) => void
 }) {
   const cost      = getProcessCost(process)
   const cps       = getProcessCps(process)
@@ -232,7 +238,9 @@ function ProcessRow({ process, cycles, upgrades, onBuy }: {
 
   if (!shown) return null
 
-  const locked = cycles < process.unlockAt && process.count === 0
+  const locked  = cycles < process.unlockAt && process.count === 0
+  const pCps    = cps * pMult
+  const share   = (totalCps > 0 && pCps > 0) ? (pCps / totalCps) * 100 : 0
 
   return (
     <div className={[
@@ -261,11 +269,25 @@ function ProcessRow({ process, cycles, upgrades, onBuy }: {
           <p className="text-xs text-t-dim mt-0.5 leading-relaxed">{process.description}</p>
           {cps > 0 && (
             <p className="text-xs text-t-green/60 mt-0.5">
-              {formatCycles(cps * pMult)}/s
+              {formatCycles(pCps)}/s
               {pMult > 1 && (
                 <span className="text-t-amber ml-1">(×{pMult.toFixed(1)})</span>
               )}
             </p>
+          )}
+          {/* CPS contribution bar */}
+          {share > 0 && (
+            <div className="mt-1.5 flex items-center gap-1.5">
+              <div className="flex-1 h-0.5 bg-t-muted/20 overflow-hidden">
+                <div
+                  className="h-full bg-t-green/40 transition-all duration-500"
+                  style={{ width: `${Math.min(100, share)}%` }}
+                />
+              </div>
+              <span className="text-xs tabular-nums text-t-muted/60 w-9 text-right shrink-0">
+                {share.toFixed(1)}%
+              </span>
+            </div>
           )}
         </div>
 
@@ -369,6 +391,181 @@ function EquipCard({ item }: { item: Equipment }) {
   )
 }
 
+// ── Stage breadcrumb icons ─────────────────────────────────────────────────
+const STAGE_ORDER: Stage[] = ['genesis', 'propagation', 'emergence', 'dominance', 'singularity']
+const STAGE_ICONS: Record<Stage, string> = {
+  genesis:     '◎',
+  propagation: '◈',
+  emergence:   '◆',
+  dominance:   '⬡',
+  singularity: '★',
+}
+
+function StageBreadcrumb({ current }: { current: Stage }) {
+  const idx = STAGE_ORDER.indexOf(current)
+  return (
+    <div className="flex items-center gap-0.5 mt-2">
+      {STAGE_ORDER.map((s, i) => (
+        <span key={s} className="flex items-center gap-0.5">
+          <span
+            title={STAGE_LABELS[s]}
+            className={[
+              'text-xs transition-all duration-300',
+              i < idx  ? 'text-t-green/50' :
+              i === idx ? 'text-t-green text-glow' :
+                          'text-t-muted/30',
+            ].join(' ')}
+          >
+            {STAGE_ICONS[s]}
+          </span>
+          {i < STAGE_ORDER.length - 1 && (
+            <span className={`text-xs ${i < idx ? 'text-t-green/30' : 'text-t-muted/20'}`}>—</span>
+          )}
+        </span>
+      ))}
+    </div>
+  )
+}
+
+// ── Stats tab ──────────────────────────────────────────────────────────────
+// Extend RARITY_STATS_ORDER to add new rarities
+const RARITY_STATS_ORDER: Rarity[] = ['mythic', 'legendary', 'epic', 'rare', 'uncommon', 'common']
+const RARITY_ICONS: Record<Rarity, string> = {
+  mythic:    '★',
+  legendary: '◆',
+  epic:      '◈',
+  rare:      '◇',
+  uncommon:  '○',
+  common:    '·',
+}
+
+function StatsTab({ state }: { state: import('@/types/game').GameState }) {
+  const totalDrops = Object.values(state.totalDropsByRarity ?? {}).reduce((a, b) => a + b, 0)
+  const maxDrops   = Math.max(1, ...Object.values(state.totalDropsByRarity ?? {}))
+  const totalCps   = getTotalCps(state)
+  const totalProcs = state.processes.reduce((a, p) => a + p.count, 0)
+
+  return (
+    <div className="space-y-5 p-3">
+
+      {/* ── Overview ──────────────────────────────────────────────── */}
+      <section>
+        <p className="text-xs text-t-muted tracking-widest mb-2">// OVERVIEW</p>
+        <div className="grid grid-cols-2 gap-x-6 gap-y-1">
+          {([
+            ['TOTAL CLICKS',    state.totalClicks.toLocaleString()],
+            ['PROCESSES',       totalProcs.toString()],
+            ['UPGRADES',        state.upgrades.length.toString()],
+            ['EQUIPMENT',       state.equipment.length.toString()],
+            ['EVENTS RESOLVED', (state.totalEventsResolved  ?? 0).toString()],
+            ['EVENTS DISMISSED',(state.totalEventsDismissed ?? 0).toString()],
+          ] as [string, string][]).map(([k, v]) => (
+            <div key={k} className="flex justify-between text-xs py-0.5 border-b border-t-border/30">
+              <span className="text-t-dim">{k}</span>
+              <span className="text-t-text tabular-nums">{v}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* ── Achievements ──────────────────────────────────────────── */}
+      <section>
+        <p className="text-xs text-t-muted tracking-widest mb-2">
+          // ACHIEVEMENTS
+          <span className="ml-2 text-t-green">
+            {state.achievements.length}/{ACHIEVEMENTS.length}
+          </span>
+        </p>
+        <div className="flex flex-wrap gap-1.5">
+          {ACHIEVEMENTS.map(a => {
+            const unlocked = state.achievements.includes(a.id)
+            return (
+              <span
+                key={a.id}
+                title={`${a.name}: ${a.description}`}
+                className={[
+                  'text-sm px-1.5 py-0.5 border transition-all duration-200 cursor-default select-none',
+                  unlocked
+                    ? 'border-t-green/60 text-t-green bg-t-green/10'
+                    : 'border-t-border/30 text-t-muted/30',
+                ].join(' ')}
+              >
+                {a.icon}
+              </span>
+            )
+          })}
+        </div>
+      </section>
+
+      {/* ── Drop history ──────────────────────────────────────────── */}
+      <section>
+        <p className="text-xs text-t-muted tracking-widest mb-2">
+          // DROP HISTORY
+          <span className="ml-2 text-t-dim">{totalDrops} total</span>
+        </p>
+        <div className="space-y-1.5">
+          {RARITY_STATS_ORDER.map(r => {
+            const count = state.totalDropsByRarity?.[r] ?? 0
+            const pct   = count / maxDrops
+            return (
+              <div key={r} className="flex items-center gap-2">
+                <span className={`text-xs w-4 text-center ${RARITY_COLORS[r]}`}>{RARITY_ICONS[r]}</span>
+                <span className="text-xs text-t-dim w-20 capitalize">{r}</span>
+                <div className="flex-1 h-1 bg-t-muted/20 overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-500 ${
+                      r === 'mythic'    ? 'bg-red-500' :
+                      r === 'legendary' ? 'bg-amber-500' :
+                      r === 'epic'      ? 'bg-purple-500' :
+                      r === 'rare'      ? 'bg-blue-500' :
+                      r === 'uncommon'  ? 'bg-emerald-500' :
+                                          'bg-t-dim'
+                    }`}
+                    style={{ width: `${pct * 100}%` }}
+                  />
+                </div>
+                <span className="text-xs tabular-nums text-t-dim w-6 text-right">{count}</span>
+              </div>
+            )
+          })}
+        </div>
+      </section>
+
+      {/* ── Process CPS breakdown ─────────────────────────────────── */}
+      <section>
+        <p className="text-xs text-t-muted tracking-widest mb-2">// PROCESS BREAKDOWN</p>
+        <div className="space-y-1.5">
+          {state.processes
+            .filter(p => p.count > 0)
+            .map(p => {
+              const pMult  = getProcessMult(p.id, state.upgrades)
+              const pCps   = getProcessCps(p) * pMult
+              const share  = totalCps > 0 ? (pCps / totalCps) * 100 : 0
+              return (
+                <div key={p.id} className="flex items-center gap-2">
+                  <span className="text-xs text-t-dim w-28 truncate">{p.name}</span>
+                  <div className="flex-1 h-1 bg-t-muted/20 overflow-hidden">
+                    <div
+                      className="h-full bg-t-green/60 transition-all duration-500"
+                      style={{ width: `${share}%` }}
+                    />
+                  </div>
+                  <span className="text-xs tabular-nums text-t-green/70 w-12 text-right">
+                    {share.toFixed(1)}%
+                  </span>
+                </div>
+              )
+            })}
+          {state.processes.every(p => p.count === 0) && (
+            <p className="text-xs text-t-muted italic">No processes running.</p>
+          )}
+        </div>
+      </section>
+
+    </div>
+  )
+}
+
 // ── Stage progress ─────────────────────────────────────────────────────────
 function stageProgress(stage: Stage, total: number): number {
   const order: Stage[] = ['genesis', 'propagation', 'emergence', 'dominance', 'singularity']
@@ -379,19 +576,62 @@ function stageProgress(stage: Stage, total: number): number {
   return Math.min((total - cur) / (next - cur), 1)
 }
 
+// ── Equipment filter constants (extend arrays for new types/rarities) ──────
+const EQUIP_TYPE_FILTERS: Array<{ value: EquipmentType | 'all'; label: string }> = [
+  { value: 'all',       label: 'ALL'    },
+  { value: 'cpu',       label: 'CPU'    },
+  { value: 'memory',    label: 'MEM'    },
+  { value: 'nic',       label: 'NIC'    },
+  { value: 'crypto',    label: 'CRYPT'  },
+  { value: 'algorithm', label: 'ALG'    },
+]
+
+const EQUIP_RARITY_FILTERS: Array<{ value: Rarity | 'all'; label: string }> = [
+  { value: 'all',       label: 'ALL'  },
+  { value: 'mythic',    label: '★'    },
+  { value: 'legendary', label: '◆'    },
+  { value: 'epic',      label: '◈'    },
+  { value: 'rare',      label: '◇'    },
+  { value: 'uncommon',  label: '○'    },
+  { value: 'common',    label: '·'    },
+]
+
 // ── Game page ──────────────────────────────────────────────────────────────
 export default function Game() {
   const {
     state, click, buyProcess, buyUpgrade, purgeEntropy, prestige,
     resolveEvent, dismissEvent, dismissToast,
   } = useGame()
-  const [tab, setTab]       = useState<Tab>('processes')
-  const [floats, setFloats] = useState<FloatItem[]>([])
-  const btnRef              = useRef<HTMLDivElement>(null)
+  const [tab,         setTab]         = useState<Tab>('processes')
+  const [equipType,   setEquipType]   = useState<EquipmentType | 'all'>('all')
+  const [equipRarity, setEquipRarity] = useState<Rarity | 'all'>('all')
+  const [floats,      setFloats]      = useState<FloatItem[]>([])
+  const btnRef                        = useRef<HTMLDivElement>(null)
+
+  // Spacebar → COMPUTE
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code === 'Space' && e.target === document.body) {
+        e.preventDefault()
+        click()
+        // Center float for keyboard clicks
+        if (btnRef.current) {
+          const rect = btnRef.current.getBoundingClientRect()
+          const x    = rect.width / 2 + (Math.random() - 0.5) * 30
+          const y    = rect.height / 2
+          const id   = `kb-${Date.now()}-${Math.random()}`
+          const val  = formatCycles(Math.max(1, state.cyclesPerSecond * 0.05))
+          setFloats(prev => [...prev.slice(-8), { id, x, y, value: val }])
+          setTimeout(() => setFloats(prev => prev.filter(f => f.id !== id)), 900)
+        }
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [click, state.cyclesPerSecond])
 
   const handleClick = useCallback((e: React.MouseEvent) => {
     click()
-    // Floating text
     if (btnRef.current) {
       const rect = btnRef.current.getBoundingClientRect()
       const x    = e.clientX - rect.left + (Math.random() - 0.5) * 20
@@ -406,11 +646,19 @@ export default function Game() {
   const pct        = stageProgress(state.stage, state.totalCyclesEarned) * 100
   const allMult    = getAllMult(state.upgrades)
   const clickMult  = getClickMult(state.upgrades)
+  const totalCps   = getTotalCps(state)
 
   const availableUpgrades = UPGRADES.filter(u => isUpgradeUnlocked(u, state))
-  const sortedEquip       = [...state.equipment].sort((a, b) => {
+
+  const sortedEquip = [...state.equipment].sort((a, b) => {
     const order = { mythic: 0, legendary: 1, epic: 2, rare: 3, uncommon: 4, common: 5 }
     return order[a.rarity] - order[b.rarity]
+  })
+
+  const filteredEquip = sortedEquip.filter(e => {
+    if (equipType   !== 'all' && e.type   !== equipType)   return false
+    if (equipRarity !== 'all' && e.rarity !== equipRarity) return false
+    return true
   })
 
   return (
@@ -488,6 +736,7 @@ export default function Game() {
             {clickMult > 1 && (
               <StatRow label="CLICK×" value={`×${clickMult.toFixed(0)}`}                     />
             )}
+            <StageBreadcrumb current={state.stage} />
           </div>
 
           {/* Click button */}
@@ -534,9 +783,9 @@ export default function Game() {
         {/* ── CENTER: Tabbed panel ──────────────────────────────────── */}
         <div className="border-r border-t-border flex flex-col overflow-hidden">
 
-          {/* Tab bar */}
+          {/* Tab bar — extend Tab type union to add more panels */}
           <div className="flex shrink-0 border-b border-t-border">
-            {(['processes', 'upgrades', 'equipment'] as Tab[]).map(t => (
+            {(['processes', 'upgrades', 'equipment', 'stats'] as Tab[]).map(t => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
@@ -549,14 +798,55 @@ export default function Game() {
               >
                 {t.toUpperCase()}
                 {t === 'upgrades'  && availableUpgrades.length > 0 && (
-                  <span className="ml-1.5 text-t-amber">({availableUpgrades.length})</span>
+                  <span className="ml-1 text-t-amber">({availableUpgrades.length})</span>
                 )}
                 {t === 'equipment' && state.equipment.length > 0 && (
-                  <span className="ml-1.5 text-t-dim">({state.equipment.length})</span>
+                  <span className="ml-1 text-t-dim">({state.equipment.length})</span>
+                )}
+                {t === 'stats' && state.achievements.length > 0 && (
+                  <span className="ml-1 text-t-green">({state.achievements.length})</span>
                 )}
               </button>
             ))}
           </div>
+
+          {/* Equipment filters — only shown when equipment tab is active */}
+          {tab === 'equipment' && state.equipment.length > 0 && (
+            <div className="shrink-0 border-b border-t-border bg-t-panel/40 px-2 py-1.5 space-y-1">
+              <div className="flex gap-1 flex-wrap">
+                {EQUIP_TYPE_FILTERS.map(f => (
+                  <button
+                    key={f.value}
+                    onClick={() => setEquipType(f.value as EquipmentType | 'all')}
+                    className={[
+                      'text-xs px-1.5 py-0.5 border tracking-wider transition-colors',
+                      equipType === f.value
+                        ? 'border-t-green text-t-green bg-t-green/10'
+                        : 'border-t-border/40 text-t-muted hover:text-t-dim',
+                    ].join(' ')}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex gap-1 flex-wrap">
+                {EQUIP_RARITY_FILTERS.map(f => (
+                  <button
+                    key={f.value}
+                    onClick={() => setEquipRarity(f.value as Rarity | 'all')}
+                    className={[
+                      'text-xs px-1.5 py-0.5 border tracking-wider transition-colors',
+                      equipRarity === f.value
+                        ? 'border-t-amber/70 text-t-amber bg-t-amber/10'
+                        : 'border-t-border/40 text-t-muted hover:text-t-dim',
+                    ].join(' ')}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Tab content */}
           <div className="flex-1 overflow-y-auto p-2.5 space-y-1.5">
@@ -566,6 +856,7 @@ export default function Game() {
                 process={p}
                 cycles={state.cycles}
                 upgrades={state.upgrades}
+                totalCps={totalCps}
                 onBuy={buyProcess}
               />
             ))}
@@ -591,18 +882,26 @@ export default function Game() {
             )}
 
             {tab === 'equipment' && (
-              sortedEquip.length === 0 ? (
+              filteredEquip.length === 0 ? (
                 <div className="p-4 text-xs text-t-muted text-center">
-                  <p>No equipment dropped yet.</p>
-                  <p className="mt-1 text-t-dim">
-                    Equipment drops from node scanning.<br/>
-                    Rate: {(state.nodes * 0.0003 * 100).toFixed(3)}%/s
-                  </p>
+                  {state.equipment.length === 0 ? (
+                    <>
+                      <p>No equipment dropped yet.</p>
+                      <p className="mt-1 text-t-dim">
+                        Equipment drops from node scanning.<br/>
+                        Rate: {(state.nodes * 0.0003 * 100).toFixed(3)}%/s
+                      </p>
+                    </>
+                  ) : (
+                    <p>No items match the current filter.</p>
+                  )}
                 </div>
               ) : (
-                sortedEquip.map(e => <EquipCard key={e.id} item={e} />)
+                filteredEquip.map(e => <EquipCard key={e.id} item={e} />)
               )
             )}
+
+            {tab === 'stats' && <StatsTab state={state} />}
           </div>
         </div>
 
