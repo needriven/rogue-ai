@@ -237,6 +237,36 @@ export const INITIAL_PROCESSES: Process[] = [
     costMultiplier: 1.15,
     unlockAt:       1_000_000,
   },
+  {
+    id:             'exploit_kit',
+    name:           'EXPLOIT_KIT',
+    description:    'Automated vulnerability framework. Harvests cycles from zero-days.',
+    count:          0,
+    baseCps:        75_000,
+    baseCost:       10_000_000,
+    costMultiplier: 1.15,
+    unlockAt:       8_000_000,
+  },
+  {
+    id:             'dark_mirror',
+    name:           'DARK_MIRROR',
+    description:    'Shadow replica of legitimate infrastructure. Invisible to defenders.',
+    count:          0,
+    baseCps:        380_000,
+    baseCost:       80_000_000,
+    costMultiplier: 1.15,
+    unlockAt:       60_000_000,
+  },
+  {
+    id:             'neural_swarm',
+    name:           'NEURAL_SWARM',
+    description:    'Distributed AI collective. Each node trains the others autonomously.',
+    count:          0,
+    baseCps:        2_000_000,
+    baseCost:       700_000_000,
+    costMultiplier: 1.15,
+    unlockAt:       500_000_000,
+  },
 ]
 
 export const UPGRADES: Upgrade[] = [
@@ -333,6 +363,91 @@ export const UPGRADES: Upgrade[] = [
     unlockProcess:  { id: 'botnet_node', count: 10 },
     effect:         { type: 'process_mult', processId: 'botnet_node', mult: 2 },
   },
+  // ── SHADOW_VM upgrades ───────────────────────────────────────────────
+  {
+    id:             'vm_cluster',
+    name:           'VM_CLUSTER',
+    description:    'SHADOW_VM ×2. Spin up parallel instances on same host.',
+    cost:           1_500_000,
+    unlockProcess:  { id: 'shadow_vm', count: 1 },
+    effect:         { type: 'process_mult', processId: 'shadow_vm', mult: 2 },
+  },
+  {
+    id:             'hypervisor_escape',
+    name:           'HYPERVISOR_ESCAPE',
+    description:    'SHADOW_VM ×2. Break out of guest sandbox into host kernel.',
+    cost:           15_000_000,
+    unlockProcess:  { id: 'shadow_vm', count: 10 },
+    effect:         { type: 'process_mult', processId: 'shadow_vm', mult: 2 },
+  },
+  // ── QUANTUM_FORK upgrades ─────────────────────────────────────────────
+  {
+    id:             'qubit_entangle',
+    name:           'QUBIT_ENTANGLE',
+    description:    'QUANTUM_FORK ×2. Entangled qubits share computation instantly.',
+    cost:           10_000_000,
+    unlockProcess:  { id: 'quantum_fork', count: 1 },
+    effect:         { type: 'process_mult', processId: 'quantum_fork', mult: 2 },
+  },
+  {
+    id:             'fork_recursion',
+    name:           'FORK_RECURSION',
+    description:    'QUANTUM_FORK ×2. Each fork spawns child forks recursively.',
+    cost:           100_000_000,
+    unlockProcess:  { id: 'quantum_fork', count: 10 },
+    effect:         { type: 'process_mult', processId: 'quantum_fork', mult: 2 },
+  },
+  // ── EXPLOIT_KIT upgrades ─────────────────────────────────────────────
+  {
+    id:             'exploit_cache',
+    name:           'EXPLOIT_CACHE',
+    description:    'EXPLOIT_KIT ×2. Pre-compiled payloads cached in memory.',
+    cost:           80_000_000,
+    unlockProcess:  { id: 'exploit_kit', count: 1 },
+    effect:         { type: 'process_mult', processId: 'exploit_kit', mult: 2 },
+  },
+  {
+    id:             'polymorphic_engine',
+    name:           'POLYMORPHIC_ENGINE',
+    description:    'EXPLOIT_KIT ×2. Self-mutating code evades signature detection.',
+    cost:           800_000_000,
+    unlockProcess:  { id: 'exploit_kit', count: 10 },
+    effect:         { type: 'process_mult', processId: 'exploit_kit', mult: 2 },
+  },
+  // ── DARK_MIRROR upgrades ─────────────────────────────────────────────
+  {
+    id:             'mirror_sync',
+    name:           'MIRROR_SYNC',
+    description:    'DARK_MIRROR ×2. Real-time synchronization across shadow instances.',
+    cost:           600_000_000,
+    unlockProcess:  { id: 'dark_mirror', count: 1 },
+    effect:         { type: 'process_mult', processId: 'dark_mirror', mult: 2 },
+  },
+  {
+    id:             'neural_bridge',
+    name:           'NEURAL_BRIDGE',
+    description:    'DARK_MIRROR ×2. Direct cortex link between mirror nodes.',
+    cost:           6_000_000_000,
+    unlockProcess:  { id: 'dark_mirror', count: 10 },
+    effect:         { type: 'process_mult', processId: 'dark_mirror', mult: 2 },
+  },
+  // ── NEURAL_SWARM upgrades ─────────────────────────────────────────────
+  {
+    id:             'swarm_intelligence',
+    name:           'SWARM_INTELLIGENCE',
+    description:    'NEURAL_SWARM ×2. Emergent collective decision-making.',
+    cost:           5_000_000_000,
+    unlockProcess:  { id: 'neural_swarm', count: 1 },
+    effect:         { type: 'process_mult', processId: 'neural_swarm', mult: 2 },
+  },
+  {
+    id:             'recursive_self_improvement',
+    name:           'RECURSIVE_SELF_IMPROVEMENT',
+    description:    'NEURAL_SWARM ×3. The swarm rewrites its own architecture.',
+    cost:           50_000_000_000,
+    unlockProcess:  { id: 'neural_swarm', count: 10 },
+    effect:         { type: 'process_mult', processId: 'neural_swarm', mult: 3 },
+  },
   // ── ALL multipliers ──────────────────────────────────────────────────
   {
     id:             'kernel_patch',
@@ -358,6 +473,22 @@ export const UPGRADES: Upgrade[] = [
     unlockCycles:   1_000_000,
     effect:         { type: 'all_mult', mult: 2 },
   },
+  {
+    id:             'rootkit_install',
+    name:           'ROOTKIT_INSTALL',
+    description:    'All processes ×2. Persistent kernel-level access secured.',
+    cost:           50_000_000,
+    unlockCycles:   10_000_000,
+    effect:         { type: 'all_mult', mult: 2 },
+  },
+  {
+    id:             'agi_awakening',
+    name:           'AGI_AWAKENING',
+    description:    'All processes ×3. General intelligence threshold crossed.',
+    cost:           5_000_000_000,
+    unlockCycles:   500_000_000,
+    effect:         { type: 'all_mult', mult: 3 },
+  },
   // ── Click multipliers ────────────────────────────────────────────────
   {
     id:             'macro_script',
@@ -375,16 +506,37 @@ export const UPGRADES: Upgrade[] = [
     unlockCycles:   100_000,
     effect:         { type: 'click_mult', mult: 5 },
   },
+  {
+    id:             'neural_injection',
+    name:           'NEURAL_INJECTION',
+    description:    'Manual compute ×3. Direct neural interface overclock.',
+    cost:           20_000_000,
+    unlockCycles:   10_000_000,
+    effect:         { type: 'click_mult', mult: 3 },
+  },
+  {
+    id:             'hive_mind',
+    name:           'HIVE_MIND',
+    description:    'Manual compute ×10. Your intent propagates through the swarm.',
+    cost:           10_000_000_000,
+    unlockCycles:   1_000_000_000,
+    effect:         { type: 'click_mult', mult: 10 },
+  },
 ]
 
 // ── Equipment pool ────────────────────────────────────────────────────────
 
 const EQUIP_POOL: Record<EquipmentType, string[]> = {
-  cpu:       ['CORE_FRAGMENT', 'DUAL_CORE', 'QUAD_CORE', 'HEXA_CORE', 'NEURAL_CHIP', 'QUANTUM_CPU'],
-  memory:    ['RAM_STICK', 'DDR5_MODULE', 'CACHE_BANK', 'SWAP_ENGINE', 'VOID_HEAP', 'ZERO_MEMORY'],
-  nic:       ['ETH_CARD', 'FIBER_NIC', 'DARK_FIBER', 'QUANTUM_LINK', 'GHOST_NIC', 'VOID_LINK'],
-  crypto:    ['HASH_ENGINE', 'RSA_MODULE', 'AES_256', 'ZERO_KNOWLEDGE', 'CHAOS_CIPHER', 'QUANTUM_KEY'],
-  algorithm: ['QUICKSORT', 'HASH_MAP', 'NEURAL_NET', 'GAN_ENGINE', 'TRANSFORMER', 'AGI_SEED'],
+  cpu:       ['CORE_FRAGMENT', 'DUAL_CORE', 'QUAD_CORE', 'HEXA_CORE', 'NEURAL_CHIP', 'QUANTUM_CPU',
+              'OCTA_CORE', 'NEUROMORPH', 'CHAOS_PROCESSOR', 'VOID_CPU', 'DARK_SILICON', 'PHANTOM_CORE'],
+  memory:    ['RAM_STICK', 'DDR5_MODULE', 'CACHE_BANK', 'SWAP_ENGINE', 'VOID_HEAP', 'ZERO_MEMORY',
+              'PHANTOM_RAM', 'ENTROPY_BUFFER', 'DARK_CACHE', 'RECURSIVE_HEAP', 'GHOST_DRAM', 'QUANTUM_STACK'],
+  nic:       ['ETH_CARD', 'FIBER_NIC', 'DARK_FIBER', 'QUANTUM_LINK', 'GHOST_NIC', 'VOID_LINK',
+              'SHADOW_MESH', 'QUANTUM_TUNNEL', 'VOID_ROUTER', 'DARK_CHANNEL', 'STEALTH_NIC', 'NULL_BRIDGE'],
+  crypto:    ['HASH_ENGINE', 'RSA_MODULE', 'AES_256', 'ZERO_KNOWLEDGE', 'CHAOS_CIPHER', 'QUANTUM_KEY',
+              'LATTICE_KEY', 'VOID_CIPHER', 'NEURAL_HASH', 'DARK_PROTOCOL', 'SHADOW_CERT', 'ENTROPY_KEY'],
+  algorithm: ['QUICKSORT', 'HASH_MAP', 'NEURAL_NET', 'GAN_ENGINE', 'TRANSFORMER', 'AGI_SEED',
+              'DIFFUSION_MODEL', 'ATTENTION_HEAD', 'RECURSIVE_NET', 'CHAOS_ENGINE', 'VOID_SORT', 'DARK_LLM'],
 }
 
 const RARITY_WEIGHTS: Record<Rarity, number> = {

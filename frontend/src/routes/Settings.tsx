@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import { useGameState } from '@/hooks/useGameState'
+import { useGame } from '@/context/GameContext'
 import { useCloudSync } from '@/hooks/useCloudSync'
 import { type SaveSlot, STAGE_LABELS, formatCycles } from '@/types/game'
 
@@ -117,7 +117,7 @@ export default function Settings() {
   const {
     state, getSaveSlots, saveToSlot, loadFromSlot,
     exportSave, importSave, resetGame,
-  } = useGameState()
+  } = useGame()
 
   const {
     sessionId, cloudMeta, isLoading: cloudLoading, fetchError,

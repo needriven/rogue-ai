@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   type GameState,
   type Process,
@@ -139,7 +139,10 @@ function loadState(): GameState {
 
 // ── Tick ───────────────────────────────────────────────────────────────────
 function tick(prev: GameState): GameState {
-  const dt        = TICK_MS / 1000
+  const now       = Date.now()
+  const elapsed   = now - prev.lastTick
+  // Cap at 10s to avoid double-counting with the offline system
+  const dt        = Math.min(elapsed, 10_000) / 1000
   const cps       = getTotalCps(prev)
   const gained    = cps * dt
   const newTotal  = prev.totalCyclesEarned + gained
@@ -263,8 +266,8 @@ function tick(prev: GameState): GameState {
     equipment,
     log:                 logs,
     toasts,
-    totalPlaytimeMs:     prev.totalPlaytimeMs + TICK_MS,
-    lastTick:            Date.now(),
+    totalPlaytimeMs:     prev.totalPlaytimeMs + elapsed,
+    lastTick:            now,
     activeEvent:         activeEvent as unknown,
     cpsEventMult,
     achievements,
@@ -277,17 +280,28 @@ function tick(prev: GameState): GameState {
 export function useGameState() {
   const [state, setState] = useState<GameState>(loadState)
 
+  // Keep a ref so save/unload handlers always see latest state
+  // without being part of any effect dependency array
+  const stateRef = useRef<GameState>(state)
+  useEffect(() => { stateRef.current = state })
+
   useEffect(() => {
     const id = setInterval(() => setState(tick), TICK_MS)
     return () => clearInterval(id)
   }, [])
 
+  // Auto-save every 5s on a stable interval (not reset by every tick)
   useEffect(() => {
-    const id = setInterval(() => {
-      localStorage.setItem(SAVE_KEY, JSON.stringify(state))
-    }, 5_000)
-    return () => clearInterval(id)
-  }, [state])
+    const save = () => localStorage.setItem(SAVE_KEY, JSON.stringify(stateRef.current))
+    const id   = setInterval(save, 5_000)
+    // Also save immediately when user leaves the page
+    window.addEventListener('beforeunload', save)
+    return () => {
+      clearInterval(id)
+      window.removeEventListener('beforeunload', save)
+      save() // save on unmount (route navigation)
+    }
+  }, [])
 
   // ── Actions ──────────────────────────────────────────────────────────
 

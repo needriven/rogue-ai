@@ -1,6 +1,7 @@
 import { Outlet, Link, useMatchRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { useGameState } from '@/hooks/useGameState'
+import { GameContext } from '@/context/GameContext'
 import OfflineModal from '@/components/OfflineModal'
 
 const NAV_ITEMS = [
@@ -49,7 +50,8 @@ function NavItem({ to, label, icon, exact }: {
 
 export default function Root() {
   const [uptime, setUptime] = useState(0)
-  const { state, dismissOfflineReport } = useGameState()
+  const game = useGameState()
+  const { state, dismissOfflineReport } = game
 
   useEffect(() => {
     const start = Date.now()
@@ -126,7 +128,9 @@ export default function Root() {
         </aside>
 
         <main className="flex-1 min-w-0 overflow-auto bg-t-bg">
-          <Outlet />
+          <GameContext.Provider value={game}>
+            <Outlet />
+          </GameContext.Provider>
         </main>
       </div>
     </div>

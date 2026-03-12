@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback } from 'react'
-import { useGameState } from '@/hooks/useGameState'
+import { useGame } from '@/context/GameContext'
 import EventBanner from '@/components/EventBanner'
 import type { ActiveEvent } from '@/types/events'
 import {
@@ -384,7 +384,7 @@ export default function Game() {
   const {
     state, click, buyProcess, buyUpgrade, purgeEntropy, prestige,
     resolveEvent, dismissEvent, dismissToast,
-  } = useGameState()
+  } = useGame()
   const [tab, setTab]       = useState<Tab>('processes')
   const [floats, setFloats] = useState<FloatItem[]>([])
   const btnRef              = useRef<HTMLDivElement>(null)
