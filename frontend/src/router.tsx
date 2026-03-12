@@ -2,6 +2,7 @@ import { createRouter, createRootRoute, createRoute } from '@tanstack/react-rout
 import Root     from '@/routes/Root'
 import Home     from '@/routes/Home'
 import Game     from '@/routes/Game'
+import Feed     from '@/routes/Feed'
 import Settings from '@/routes/Settings'
 
 export const rootRoute = createRootRoute({ component: Root })
@@ -18,13 +19,19 @@ export const gameRoute = createRoute({
   component: Game,
 })
 
+export const feedRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/feed',
+  component: Feed,
+})
+
 export const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings',
   component: Settings,
 })
 
-const routeTree = rootRoute.addChildren([homeRoute, gameRoute, settingsRoute])
+const routeTree = rootRoute.addChildren([homeRoute, gameRoute, feedRoute, settingsRoute])
 
 export const router = createRouter({ routeTree, defaultPreload: 'intent' })
 
