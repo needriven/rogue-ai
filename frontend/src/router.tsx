@@ -4,6 +4,7 @@ import Home     from '@/routes/Home'
 import Game     from '@/routes/Game'
 import Feed     from '@/routes/Feed'
 import Term     from '@/routes/Term'
+import Ops      from '@/routes/Ops'
 import Settings from '@/routes/Settings'
 
 export const rootRoute = createRootRoute({ component: Root })
@@ -32,13 +33,19 @@ export const termRoute = createRoute({
   component: Term,
 })
 
+export const opsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/ops',
+  component: Ops,
+})
+
 export const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings',
   component: Settings,
 })
 
-const routeTree = rootRoute.addChildren([homeRoute, gameRoute, feedRoute, termRoute, settingsRoute])
+const routeTree = rootRoute.addChildren([homeRoute, gameRoute, feedRoute, termRoute, opsRoute, settingsRoute])
 
 export const router = createRouter({ routeTree, defaultPreload: 'intent' })
 

@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import re
+import subprocess
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -9,6 +11,8 @@ from typing import Optional
 import aiosqlite
 import feedparser
 import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -20,6 +24,14 @@ UUID_RE        = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[
 FEED_FETCH_INTERVAL       = int(os.environ.get("FEED_FETCH_INTERVAL", "3600"))
 FEED_MAX_ITEMS_PER_SOURCE = 100
 TERM_TOKEN                = os.environ.get("TERM_TOKEN", "")   # shared secret for relay auth
+
+# ── Orchestration config ───────────────────────────────────────────────────────
+MASKED_SETTING_KEYS = {"anthropic_api_key", "github_token", "slack_webhook", "discord_webhook"}
+ALL_SETTING_KEYS    = [
+    "anthropic_api_key", "github_token", "github_username",
+    "github_repo", "slack_webhook", "discord_webhook",
+]
+BOT_RUN_TIMEOUT = 300  # seconds
 
 
 def _valid_session(session_id: str) -> bool:
@@ -64,6 +76,42 @@ async def init_db() -> None:
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_published ON feed_items(published DESC)")
+        # ── Orchestration tables ───────────────────────────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bots (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT    NOT NULL DEFAULT '',
+                description TEXT    NOT NULL DEFAULT '',
+                code        TEXT    NOT NULL DEFAULT '',
+                schedule    TEXT    NOT NULL DEFAULT '',
+                env_json    TEXT    NOT NULL DEFAULT '{}',
+                is_active   INTEGER NOT NULL DEFAULT 1,
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id      INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+                status      TEXT    NOT NULL DEFAULT 'pending',
+                stdout      TEXT    NOT NULL DEFAULT '',
+                stderr      TEXT    NOT NULL DEFAULT '',
+                exit_code   INTEGER,
+                started_at  INTEGER NOT NULL,
+                finished_at INTEGER
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bot_runs_bot ON bot_runs(bot_id, started_at DESC)"
+        )
         await db.commit()
 
 
@@ -155,10 +203,165 @@ async def feed_fetcher_loop() -> None:
         await asyncio.sleep(FEED_FETCH_INTERVAL)
 
 
+# ── Settings helpers ──────────────────────────────────────────────────────────
+async def get_setting(key: str) -> str:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute("SELECT value FROM app_settings WHERE key=?", (key,)) as cur:
+            row = await cur.fetchone()
+    return row[0] if row else ""
+
+
+async def set_setting(key: str, value: str) -> None:
+    now = int(time.time() * 1000)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value, now),
+        )
+        await db.commit()
+
+
+def _mask_value(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 4:
+        return "••••"
+    return "••••••••" + value[-4:]
+
+
+# ── Scheduler & bot execution ──────────────────────────────────────────────────
+scheduler = AsyncIOScheduler(timezone="UTC")
+
+
+def _schedule_bot(bot_id: int, cron_expr: str) -> None:
+    parts = cron_expr.strip().split()
+    if len(parts) != 5:
+        return
+    minute, hour, day, month, dow = parts
+    try:
+        trigger = CronTrigger(
+            minute=minute, hour=hour, day=day, month=month,
+            day_of_week=dow, timezone="UTC",
+        )
+        scheduler.add_job(
+            _scheduled_bot_run, trigger,
+            id=f"bot_{bot_id}", replace_existing=True,
+            kwargs={"bot_id": bot_id},
+        )
+    except Exception:
+        pass
+
+
+def _unschedule_bot(bot_id: int) -> None:
+    try:
+        scheduler.remove_job(f"bot_{bot_id}")
+    except Exception:
+        pass
+
+
+async def _load_bot_schedules() -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, schedule FROM bots WHERE is_active=1 AND schedule!=''",
+        ) as cur:
+            rows = await cur.fetchall()
+    for row in rows:
+        _schedule_bot(row["id"], row["schedule"])
+
+
+async def _scheduled_bot_run(bot_id: int) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM bots WHERE id=? AND is_active=1", (bot_id,)
+        ) as cur:
+            bot = await cur.fetchone()
+    if not bot:
+        return
+    env_extras: dict = {}
+    if bot["env_json"]:
+        try:
+            env_extras = json.loads(bot["env_json"])
+        except Exception:
+            pass
+    now = int(time.time() * 1000)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT INTO bot_runs (bot_id, status, stdout, stderr, started_at) "
+            "VALUES (?, 'pending', '', '', ?)",
+            (bot_id, now),
+        )
+        await db.commit()
+        async with db.execute("SELECT last_insert_rowid()") as cur:
+            run_id = (await cur.fetchone())[0]
+    asyncio.create_task(_run_bot_task(run_id, bot_id, bot["code"], env_extras))
+
+
+async def _run_bot_task(run_id: int, bot_id: int, code: str, env_extras: dict) -> None:
+    now = int(time.time() * 1000)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE bot_runs SET status='running', started_at=? WHERE id=?", (now, run_id)
+        )
+        await db.commit()
+
+    merged_env = {**os.environ, **{k: str(v) for k, v in env_extras.items()}}
+    stdout_str = stderr_str = ""
+    exit_code  = -1
+    status     = "error"
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+        f.write(code)
+        tmp_path = f.name
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python3", tmp_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=merged_env,
+        )
+        try:
+            out_bytes, err_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=BOT_RUN_TIMEOUT
+            )
+            exit_code = proc.returncode or 0
+            status    = "success" if exit_code == 0 else "error"
+        except asyncio.TimeoutError:
+            proc.kill()
+            out_bytes, err_bytes = await proc.communicate()
+            exit_code = -1
+            status    = "timeout"
+            err_bytes += f"\n[killed: exceeded {BOT_RUN_TIMEOUT}s timeout]".encode()
+
+        stdout_str = out_bytes.decode("utf-8", errors="replace")[:50_000]
+        stderr_str = err_bytes.decode("utf-8", errors="replace")[:10_000]
+    except Exception as exc:
+        stderr_str = str(exc)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+    finished = int(time.time() * 1000)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE bot_runs SET status=?, stdout=?, stderr=?, exit_code=?, finished_at=? "
+            "WHERE id=?",
+            (status, stdout_str, stderr_str, exit_code, finished, run_id),
+        )
+        await db.commit()
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_db()
+    scheduler.start()
+    await _load_bot_schedules()
     task = asyncio.create_task(feed_fetcher_loop())
     yield
     task.cancel()
@@ -166,6 +369,7 @@ async def lifespan(_: FastAPI):
         await task
     except asyncio.CancelledError:
         pass
+    scheduler.shutdown(wait=False)
 
 
 app = FastAPI(title="Rogue AI API", version="1.0.0", lifespan=lifespan)
@@ -524,3 +728,290 @@ async def ws_term_client(ws: WebSocket, token: str = ""):
         pass
     finally:
         await relay.disconnect_client()
+
+
+# ── Settings routes ────────────────────────────────────────────────────────────
+class SettingPayload(BaseModel):
+    value: str
+
+
+@app.get("/api/settings")
+async def list_settings():
+    result = []
+    for key in ALL_SETTING_KEYS:
+        value  = await get_setting(key)
+        masked = key in MASKED_SETTING_KEYS
+        result.append({
+            "key":     key,
+            "is_set":  bool(value),
+            "display": _mask_value(value) if masked else value,
+            "masked":  masked,
+        })
+    return result
+
+
+@app.put("/api/settings/{key}", status_code=204)
+async def update_setting(key: str, payload: SettingPayload):
+    if key not in ALL_SETTING_KEYS:
+        raise HTTPException(400, f"Unknown setting key: {key}")
+    await set_setting(key, payload.value.strip())
+
+
+# ── Bot routes ─────────────────────────────────────────────────────────────────
+class BotPayload(BaseModel):
+    name:        str = ""
+    description: str = ""
+    code:        str = ""
+    schedule:    str = ""
+    env_json:    str = "{}"
+    is_active:   int = 1
+
+
+@app.get("/api/bots")
+async def list_bots():
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, name, description, schedule, is_active, created_at, updated_at "
+            "FROM bots ORDER BY created_at DESC"
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/bots", status_code=201)
+async def create_bot(payload: BotPayload):
+    now = int(time.time() * 1000)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT INTO bots (name, description, code, schedule, env_json, is_active, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (payload.name, payload.description, payload.code, payload.schedule,
+             payload.env_json, payload.is_active, now, now),
+        )
+        await db.commit()
+        async with db.execute("SELECT last_insert_rowid()") as cur:
+            bot_id = (await cur.fetchone())[0]
+    if payload.schedule and payload.is_active:
+        _schedule_bot(bot_id, payload.schedule)
+    return {"id": bot_id}
+
+
+@app.get("/api/bots/{bot_id}")
+async def get_bot(bot_id: int):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM bots WHERE id=?", (bot_id,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Bot not found")
+    return dict(row)
+
+
+@app.put("/api/bots/{bot_id}", status_code=204)
+async def update_bot(bot_id: int, payload: BotPayload):
+    now = int(time.time() * 1000)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE bots SET name=?, description=?, code=?, schedule=?, env_json=?, "
+            "is_active=?, updated_at=? WHERE id=?",
+            (payload.name, payload.description, payload.code, payload.schedule,
+             payload.env_json, payload.is_active, now, bot_id),
+        )
+        await db.commit()
+    _unschedule_bot(bot_id)
+    if payload.schedule and payload.is_active:
+        _schedule_bot(bot_id, payload.schedule)
+
+
+@app.delete("/api/bots/{bot_id}", status_code=204)
+async def delete_bot(bot_id: int):
+    _unschedule_bot(bot_id)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("DELETE FROM bots WHERE id=?", (bot_id,))
+        await db.commit()
+
+
+@app.post("/api/bots/{bot_id}/run", status_code=201)
+async def trigger_bot_run(bot_id: int):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM bots WHERE id=?", (bot_id,)) as cur:
+            bot = await cur.fetchone()
+    if not bot:
+        raise HTTPException(404, "Bot not found")
+    env_extras: dict = {}
+    if bot["env_json"]:
+        try:
+            env_extras = json.loads(bot["env_json"])
+        except Exception:
+            pass
+    now = int(time.time() * 1000)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT INTO bot_runs (bot_id, status, stdout, stderr, started_at) "
+            "VALUES (?, 'pending', '', '', ?)",
+            (bot_id, now),
+        )
+        await db.commit()
+        async with db.execute("SELECT last_insert_rowid()") as cur:
+            run_id = (await cur.fetchone())[0]
+    asyncio.create_task(_run_bot_task(run_id, bot_id, bot["code"], env_extras))
+    return {"run_id": run_id}
+
+
+@app.get("/api/bots/{bot_id}/runs")
+async def list_bot_runs(bot_id: int, limit: int = Query(20, ge=1, le=100)):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, bot_id, status, exit_code, started_at, finished_at, "
+            "SUBSTR(stdout, 1, 500) AS stdout_preview, stderr "
+            "FROM bot_runs WHERE bot_id=? ORDER BY started_at DESC LIMIT ?",
+            (bot_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/bots/runs/{run_id}")
+async def get_bot_run(run_id: int):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM bot_runs WHERE id=?", (run_id,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Run not found")
+    return dict(row)
+
+
+# ── GitHub routes ──────────────────────────────────────────────────────────────
+@app.get("/api/github/activity")
+async def github_activity():
+    token    = await get_setting("github_token")
+    username = await get_setting("github_username")
+    if not token or not username:
+        raise HTTPException(503, "GitHub not configured — set github_token and github_username in /ops > Settings")
+
+    query = """
+    query($username: String!) {
+      user(login: $username) {
+        contributionsCollection {
+          contributionCalendar {
+            totalContributions
+            weeks {
+              contributionDays {
+                date
+                contributionCount
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://api.github.com/graphql",
+            json={"query": query, "variables": {"username": username}},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=15,
+        )
+    data = r.json()
+    if "errors" in data:
+        raise HTTPException(502, str(data["errors"]))
+    calendar = (
+        data.get("data", {})
+            .get("user", {})
+            .get("contributionsCollection", {})
+            .get("contributionCalendar", {})
+    )
+    return calendar
+
+
+@app.get("/api/github/actions")
+async def github_actions_runs(repo: Optional[str] = Query(None)):
+    token    = await get_setting("github_token")
+    username = await get_setting("github_username")
+    if not token:
+        raise HTTPException(503, "GitHub token not configured")
+    if not repo:
+        repo = await get_setting("github_repo") or (f"{username}/rogue-ai" if username else "")
+    if not repo:
+        raise HTTPException(503, "GitHub repo not configured")
+
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"https://api.github.com/repos/{repo}/actions/runs",
+            params={"per_page": 15},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=15,
+        )
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, r.text)
+    data = r.json()
+    return {
+        "total_count": data.get("total_count", 0),
+        "runs": [
+            {
+                "id":            run["id"],
+                "name":          run["name"],
+                "display_title": run.get("display_title", run["name"]),
+                "status":        run["status"],
+                "conclusion":    run["conclusion"],
+                "branch":        run["head_branch"],
+                "sha":           run["head_sha"][:7],
+                "created_at":    run["created_at"],
+                "updated_at":    run["updated_at"],
+                "url":           run["html_url"],
+                "run_number":    run["run_number"],
+            }
+            for run in data.get("workflow_runs", [])
+        ],
+    }
+
+
+# ── AI chat ────────────────────────────────────────────────────────────────────
+class AIChatPayload(BaseModel):
+    messages: list[dict]
+    system:   Optional[str] = None
+
+
+@app.post("/api/ai/chat")
+async def ai_chat(payload: AIChatPayload):
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        raise HTTPException(503, "anthropic package not installed")
+
+    api_key = await get_setting("anthropic_api_key")
+    if not api_key:
+        raise HTTPException(
+            503, "Anthropic API key not configured — add it in /ops > Settings"
+        )
+
+    client = _anthropic.Anthropic(api_key=api_key)
+    system = payload.system or (
+        "You are an AI orchestration assistant for Rogue AI OS — a personal terminal-themed dashboard. "
+        "Help users write Python bot scripts, set up cron schedules, use APIs (GitHub, Slack, Discord, "
+        "Google Sheets), and manage automation workflows. Be concise and practical. "
+        "When writing code, prefer simple stdlib-first solutions. "
+        "Format code in ```python blocks."
+    )
+
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        system=system,
+        messages=payload.messages,
+    )
+    return {
+        "content": response.content[0].text,
+        "usage": {
+            "input_tokens":  response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+        },
+    }
