@@ -1203,3 +1203,292 @@ async def seed_sample_bots():
         created += 1
 
     return {"created": created, "message": f"{created} sample bots created"}
+
+
+# ── AI Agent (natural language → bot creation) ─────────────────────────────────
+_SKILLS_DOC = """\
+# Rogue AI OS — Bot Skills Library
+
+## HTTP requests (stdlib)
+```python
+import urllib.request, json
+def http_get(url, headers=None):
+    req = urllib.request.Request(url, headers=headers or {})
+    return json.loads(urllib.request.urlopen(req, timeout=15).read())
+
+def http_post(url, data: dict, headers=None):
+    body = json.dumps(data).encode()
+    h = {"Content-Type": "application/json", **(headers or {})}
+    req = urllib.request.Request(url, data=body, headers=h, method="POST")
+    return urllib.request.urlopen(req, timeout=15).read()
+```
+
+## Discord webhook
+```python
+import os, json, urllib.request
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
+def send_discord(message: str):
+    if not DISCORD_WEBHOOK: return
+    body = json.dumps({"content": message[:2000]}).encode()
+    req = urllib.request.Request(DISCORD_WEBHOOK, data=body,
+          headers={"Content-Type": "application/json"}, method="POST")
+    urllib.request.urlopen(req, timeout=10)
+```
+
+## Slack webhook
+```python
+import os, json, urllib.request
+SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "")
+def send_slack(message: str):
+    if not SLACK_WEBHOOK: return
+    body = json.dumps({"text": message}).encode()
+    req = urllib.request.Request(SLACK_WEBHOOK, data=body,
+          headers={"Content-Type": "application/json"}, method="POST")
+    urllib.request.urlopen(req, timeout=10)
+```
+
+## GitHub API (REST)
+```python
+import os, json, urllib.request
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_USER  = os.environ.get("GITHUB_USERNAME", "")
+GITHUB_REPO  = os.environ.get("GITHUB_REPO", "")  # "owner/repo"
+
+def gh_get(path):
+    req = urllib.request.Request(
+        f"https://api.github.com{path}",
+        headers={"Authorization": f"Bearer {GITHUB_TOKEN}",
+                 "Accept": "application/vnd.github+json"})
+    return json.loads(urllib.request.urlopen(req, timeout=15).read())
+```
+
+## State persistence (file-based, survives runs)
+```python
+import os, json
+STATE_FILE = os.path.join(os.environ.get("BOT_STATE_DIR", "/tmp"), "state.json")
+def load_state() -> dict:
+    try:    return json.loads(open(STATE_FILE).read())
+    except: return {}
+def save_state(s: dict):
+    open(STATE_FILE, "w").write(json.dumps(s))
+```
+
+## Cron schedule examples
+- Every 30 min: `*/30 * * * *`
+- Daily 9am UTC: `0 9 * * *`
+- Monday 8am: `0 8 * * 1`
+- Hourly: `0 * * * *`
+
+## Bot code template
+```python
+# bot_name — short description
+# env vars: LIST_REQUIRED_ENV_VARS_HERE
+import os, datetime
+print(f"[{datetime.datetime.utcnow().isoformat()}] bot started")
+# ... your logic here ...
+print("done")
+```
+"""
+
+_AGENT_TOOLS = [
+    {
+        "name": "list_bots",
+        "description": "List all existing bots in the system. Use this to check for duplicates before creating.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "create_bot",
+        "description": (
+            "Register and save a new Python bot. The code will run as a standalone Python script "
+            "with subprocess. Use the Skills library patterns for HTTP, Discord, Slack, GitHub. "
+            "Set schedule to a cron expression (e.g. '0 9 * * *') or leave empty for manual-only bots."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Short snake_case identifier, e.g. 'daily_report'",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "One-line description of what the bot does",
+                },
+                "code": {
+                    "type": "string",
+                    "description": "Complete Python 3 script. Must be runnable as-is.",
+                },
+                "schedule": {
+                    "type": "string",
+                    "description": "Cron expression (5 fields) or empty string for manual-only",
+                },
+                "env_vars": {
+                    "type": "object",
+                    "description": "Required environment variables as key→description mapping (NOT values)",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["name", "description", "code"],
+        },
+    },
+]
+
+
+async def _handle_agent_tool(name: str, tool_input: dict) -> str:
+    if name == "list_bots":
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, name, description, schedule, is_active FROM bots ORDER BY created_at DESC"
+            ) as cur:
+                rows = await cur.fetchall()
+        bots = [dict(r) for r in rows]
+        if not bots:
+            return "No bots registered yet."
+        lines = ["Existing bots:"]
+        for b in bots:
+            sched = b["schedule"] or "(manual)"
+            active = "active" if b["is_active"] else "inactive"
+            lines.append(f"  [{b['id']}] {b['name']} — {b['description']} | {sched} | {active}")
+        return "\n".join(lines)
+
+    if name == "create_bot":
+        bot_name    = tool_input.get("name", "").strip()
+        description = tool_input.get("description", "").strip()
+        code        = tool_input.get("code", "").strip()
+        schedule    = tool_input.get("schedule", "").strip()
+        env_vars    = tool_input.get("env_vars", {})
+        env_json    = json.dumps({k: "" for k in env_vars}) if env_vars else "{}"
+
+        now = int(time.time() * 1000)
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "INSERT INTO bots (name, description, code, schedule, env_json, "
+                "is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                (bot_name, description, code, schedule, env_json, now, now),
+            )
+            await db.commit()
+            async with db.execute("SELECT last_insert_rowid()") as cur:
+                bot_id = (await cur.fetchone())[0]
+
+        if schedule:
+            _schedule_bot(bot_id, schedule)
+
+        return (
+            f"Bot '{bot_name}' created with id={bot_id}. "
+            f"Schedule: {schedule or '(manual only)'}. "
+            f"Env vars needed: {list(env_vars.keys()) if env_vars else 'none'}."
+        )
+
+    return f"Unknown tool: {name}"
+
+
+class AgentPayload(BaseModel):
+    message: str
+
+
+@app.post("/api/ai/agent")
+async def ai_agent(payload: AgentPayload):
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        raise HTTPException(503, "anthropic package not installed")
+
+    api_key = await get_setting("anthropic_api_key")
+    if not api_key:
+        raise HTTPException(
+            503, "Anthropic API key not configured — add it in /ops > Settings"
+        )
+
+    client = _anthropic.AsyncAnthropic(api_key=api_key)
+
+    system_blocks = [
+        {
+            "type": "text",
+            "text": (
+                "You are BotForge, an AI agent inside Rogue AI OS. "
+                "Your job is to understand the user's intent and create Python bot scripts "
+                "that they can run on their OCI VM server.\n\n"
+                "Workflow:\n"
+                "1. Call list_bots to see existing bots (avoid duplicates)\n"
+                "2. Write a complete, working Python script using the Skills Library patterns\n"
+                "3. Call create_bot to register it\n"
+                "4. Briefly summarize what you built and any env vars the user needs to configure\n\n"
+                "Rules:\n"
+                "- Use only Python stdlib + requests if needed (requests is installed)\n"
+                "- Always include a comment header with bot name and required env vars\n"
+                "- Keep code simple and readable\n"
+                "- If the user's request is unclear, make a reasonable best-effort bot\n"
+            ),
+        },
+        {
+            "type": "text",
+            "text": _SKILLS_DOC,
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+    messages = [{"role": "user", "content": payload.message}]
+    tool_calls_log = []
+
+    # Agentic loop
+    for _ in range(6):  # max iterations
+        response = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2048,
+            system=system_blocks,
+            tools=_AGENT_TOOLS,
+            messages=messages,
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+        )
+
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason == "end_turn":
+            break
+
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    result = await _handle_agent_tool(block.name, block.input)
+                    tool_calls_log.append({
+                        "tool":   block.name,
+                        "input":  block.input,
+                        "result": result,
+                    })
+                    tool_results.append({
+                        "type":        "tool_result",
+                        "tool_use_id": block.id,
+                        "content":     result,
+                    })
+            messages.append({"role": "user", "content": tool_results})
+
+    # Extract final text
+    final_text = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            final_text += block.text
+
+    # Find created bot id from logs
+    created_bot_id = None
+    for tc in tool_calls_log:
+        if tc["tool"] == "create_bot":
+            import re as _re
+            m = _re.search(r"id=(\d+)", tc["result"])
+            if m:
+                created_bot_id = int(m.group(1))
+
+    return {
+        "reply":          final_text,
+        "tool_calls":     tool_calls_log,
+        "created_bot_id": created_bot_id,
+        "usage": {
+            "input_tokens":  response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+        },
+    }

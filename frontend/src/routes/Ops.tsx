@@ -615,7 +615,36 @@ function GitHubPanel() {
 // ── AI PANEL ──────────────────────────────────────────────────────────────────
 interface Message { role: 'user' | 'assistant'; content: string }
 
-function AiPanel() {
+interface ToolCall {
+  tool:   string
+  input:  Record<string, unknown>
+  result: string
+}
+
+interface AgentResponse {
+  reply:          string
+  tool_calls:     ToolCall[]
+  created_bot_id: number | null
+  usage:          { input_tokens: number; output_tokens: number }
+}
+
+function renderContent(text: string) {
+  const parts = text.split(/(```[\s\S]*?```)/g)
+  return parts.map((part, i) => {
+    if (part.startsWith('```')) {
+      const code = part.replace(/^```\w*\n?/, '').replace(/```$/, '')
+      return (
+        <pre key={i} className="bg-black/60 border border-t-border text-t-green text-xs p-2 my-1 overflow-auto leading-4">
+          {code}
+        </pre>
+      )
+    }
+    return <span key={i} className="whitespace-pre-wrap">{part}</span>
+  })
+}
+
+// Chat sub-panel (original Haiku chat)
+function ChatPanel() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput]       = useState('')
   const [loading, setLoading]   = useState(false)
@@ -647,38 +676,15 @@ function AiPanel() {
     }
   }, [input, messages, loading])
 
-  const renderContent = (text: string) => {
-    // simple code block rendering
-    const parts = text.split(/(```[\s\S]*?```)/g)
-    return parts.map((part, i) => {
-      if (part.startsWith('```')) {
-        const code = part.replace(/^```\w*\n?/, '').replace(/```$/, '')
-        return (
-          <pre key={i} className="bg-black/60 border border-t-border text-t-green text-xs p-2 my-1 overflow-auto leading-4">
-            {code}
-          </pre>
-        )
-      }
-      return <span key={i} className="whitespace-pre-wrap">{part}</span>
-    })
-  }
-
   return (
     <div className="flex flex-col h-full min-h-0">
-      <div className="flex items-center gap-2 px-4 py-2 border-b border-t-border shrink-0">
-        <span className="text-t-green text-xs">✦</span>
-        <span className="text-xs text-t-muted tracking-widest">AI ASSISTANT</span>
-        <span className="text-xs text-t-dim ml-auto">claude-haiku · cost-optimized</span>
-      </div>
-
       <div className="flex-1 overflow-y-auto px-4 py-3 flex flex-col gap-3">
         {messages.length === 0 && (
           <div className="text-t-muted text-xs space-y-1 mt-4">
-            <p>Available commands:</p>
-            <p className="text-t-dim">· write a bot that checks GitHub issues daily</p>
-            <p className="text-t-dim">· create a cron script to post to Discord webhook</p>
-            <p className="text-t-dim">· help me set up Google Sheets API integration</p>
+            <p>Ask the AI assistant anything:</p>
             <p className="text-t-dim">· explain what this cron expression does: 0 9 * * 1</p>
+            <p className="text-t-dim">· how do I send a Discord webhook from Python?</p>
+            <p className="text-t-dim">· help me debug this Python script</p>
           </div>
         )}
         {messages.map((m, i) => (
@@ -702,7 +708,6 @@ function AiPanel() {
         {error && <p className="text-t-red text-xs">{error}</p>}
         <div ref={bottomRef} />
       </div>
-
       <div className="shrink-0 px-4 py-3 border-t border-t-border flex gap-2">
         <textarea
           className="flex-1 bg-black/40 border border-t-border text-t-text text-xs px-2 py-1.5
@@ -722,6 +727,187 @@ function AiPanel() {
           SEND
         </button>
       </div>
+    </div>
+  )
+}
+
+// Agent sub-panel (BotForge: natural language → bot creation)
+function AgentPanel({ onBotCreated }: { onBotCreated: (id: number) => void }) {
+  const [input, setInput]     = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError]     = useState('')
+  const [result, setResult]   = useState<AgentResponse | null>(null)
+
+  const run = useCallback(async () => {
+    const text = input.trim()
+    if (!text || loading) return
+    setError('')
+    setResult(null)
+    setLoading(true)
+    try {
+      const res = await apiFetch<AgentResponse>(
+        '/ai/agent',
+        { method: 'POST', body: JSON.stringify({ message: text }) },
+      )
+      setResult(res)
+      if (res.created_bot_id != null) onBotCreated(res.created_bot_id)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [input, loading, onBotCreated])
+
+  const TOOL_ICONS: Record<string, string> = {
+    list_bots:  '📋',
+    create_bot: '🤖',
+  }
+
+  return (
+    <div className="flex flex-col h-full min-h-0 overflow-y-auto">
+      <div className="px-4 py-3 flex flex-col gap-3">
+        {/* Prompt examples */}
+        {!result && !loading && (
+          <div className="text-t-muted text-xs space-y-1 mt-2">
+            <p className="text-t-dim tracking-wider">BotForge — describe a bot in plain language:</p>
+            <button onClick={() => setInput('매일 오전 9시에 GitHub 이슈를 체크해서 Discord로 알려주는 봇 만들어줘')}
+              className="block text-left text-t-muted hover:text-t-text w-full py-0.5">
+              · 매일 오전 9시에 GitHub 이슈를 체크해서 Discord로 알려주는 봇
+            </button>
+            <button onClick={() => setInput('30분마다 HN Top 5를 Slack으로 보내주는 봇 만들어줘')}
+              className="block text-left text-t-muted hover:text-t-text w-full py-0.5">
+              · 30분마다 HN Top 5를 Slack으로 보내는 봇
+            </button>
+            <button onClick={() => setInput('OCI VM 디스크 사용량이 80% 넘으면 Discord 경고 보내는 봇 만들어줘')}
+              className="block text-left text-t-muted hover:text-t-text w-full py-0.5">
+              · 디스크 사용량 80% 초과 시 Discord 경고 봇
+            </button>
+          </div>
+        )}
+
+        {/* Input */}
+        <div className="flex flex-col gap-2">
+          <textarea
+            className="w-full bg-black/40 border border-t-border text-t-text text-xs px-2 py-1.5
+                       focus:outline-none focus:border-t-green font-mono resize-none h-20 leading-5"
+            placeholder="만들고 싶은 봇을 설명하세요…  (예: 매일 아침 날씨 정보 Discord 전송)"
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run() }
+            }}
+          />
+          <button
+            onClick={run} disabled={loading || !input.trim()}
+            className="self-end text-xs px-5 py-1.5 border border-t-green text-t-green
+                       hover:bg-t-green-glow disabled:opacity-30 disabled:cursor-not-allowed"
+          >
+            {loading ? 'BUILDING…' : '⚡ BUILD BOT'}
+          </button>
+        </div>
+
+        {/* Loading indicator */}
+        {loading && (
+          <div className="border border-t-border p-3 space-y-1.5">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-t-green animate-pulse" />
+              <span className="text-xs text-t-muted">BotForge is working…</span>
+            </div>
+            <p className="text-[10px] text-t-muted pl-4">checking existing bots → writing code → registering</p>
+          </div>
+        )}
+
+        {error && <p className="text-t-red text-xs border border-t-red/30 px-2 py-1">{error}</p>}
+
+        {/* Result */}
+        {result && (
+          <div className="flex flex-col gap-3">
+            {/* Tool call timeline */}
+            {result.tool_calls.length > 0 && (
+              <div className="border border-t-border">
+                <p className="text-[10px] text-t-muted tracking-widest px-2 py-1 border-b border-t-border">
+                  AGENT TRACE
+                </p>
+                {result.tool_calls.map((tc, i) => (
+                  <div key={i} className="border-b border-t-border/50 last:border-0 px-2 py-1.5">
+                    <div className="flex items-center gap-2 text-xs">
+                      <span>{TOOL_ICONS[tc.tool] ?? '⚙'}</span>
+                      <span className="text-t-green font-mono">{tc.tool}</span>
+                      {tc.tool === 'create_bot' && (
+                        <span className="text-t-dim">
+                          {(tc.input as { name?: string }).name}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[10px] text-t-muted mt-0.5 pl-5 leading-4">{tc.result}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Created bot card */}
+            {result.created_bot_id != null && (
+              <div className="border border-t-green/40 bg-t-green-glow px-3 py-2 flex items-center gap-3">
+                <span className="text-t-green text-sm">✓</span>
+                <div className="flex-1">
+                  <p className="text-xs text-t-green tracking-wider">BOT CREATED</p>
+                  <p className="text-[10px] text-t-dim">id={result.created_bot_id} · visible in BOTS tab</p>
+                </div>
+              </div>
+            )}
+
+            {/* Final reply */}
+            {result.reply && (
+              <div className="border border-t-border bg-t-panel/40 px-3 py-2 text-xs text-t-dim leading-5">
+                {renderContent(result.reply)}
+              </div>
+            )}
+
+            {/* Usage */}
+            <p className="text-[10px] text-t-muted text-right">
+              tokens: {result.usage.input_tokens}↑ {result.usage.output_tokens}↓
+            </p>
+
+            {/* Build another */}
+            <button
+              onClick={() => { setResult(null); setInput('') }}
+              className="self-start text-[10px] text-t-dim hover:text-t-text border border-t-border/50 px-2 py-1"
+            >
+              ← build another bot
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function AiPanel({ onSwitchToBots }: { onSwitchToBots: (botId: number) => void }) {
+  const [mode, setMode] = useState<'chat' | 'agent'>('agent')
+
+  const tabCls = (m: 'chat' | 'agent') =>
+    `text-[10px] tracking-widest px-3 py-1 border-b-2 transition-colors ${
+      mode === m
+        ? 'border-t-green text-t-green'
+        : 'border-transparent text-t-muted hover:text-t-dim'
+    }`
+
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      {/* Header with mode tabs */}
+      <div className="flex items-center gap-2 px-4 py-2 border-b border-t-border shrink-0">
+        <span className="text-t-green text-xs">✦</span>
+        <span className="text-xs text-t-muted tracking-widest">AI ASSISTANT</span>
+        <div className="ml-auto flex gap-0">
+          <button className={tabCls('agent')} onClick={() => setMode('agent')}>BOTFORGE</button>
+          <button className={tabCls('chat')}  onClick={() => setMode('chat')}>CHAT</button>
+        </div>
+      </div>
+
+      {mode === 'agent'
+        ? <AgentPanel onBotCreated={(id) => { onSwitchToBots(id) }} />
+        : <ChatPanel />
+      }
     </div>
   )
 }
@@ -893,7 +1079,7 @@ export default function Ops() {
       <div className="flex-1 min-h-0 overflow-hidden">
         {tab === 'bots'     && <BotsPanel />}
         {tab === 'github'   && <GitHubPanel />}
-        {tab === 'ai'       && <AiPanel />}
+        {tab === 'ai'       && <AiPanel onSwitchToBots={() => setTab('bots')} />}
         {tab === 'settings' && <SettingsPanel />}
       </div>
     </div>
