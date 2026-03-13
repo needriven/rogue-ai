@@ -415,7 +415,7 @@ function BotsPanel() {
             </button>
           ))}
         </div>
-        <div className="p-2 border-t border-t-border">
+        <div className="p-2 border-t border-t-border flex flex-col gap-1">
           <button
             onClick={() => { setIsNew(true); setSelectedId(null) }}
             className={`w-full text-xs py-1.5 border ${
@@ -424,6 +424,17 @@ function BotsPanel() {
           >
             + NEW BOT
           </button>
+          {bots.length === 0 && (
+            <button
+              onClick={async () => {
+                await apiFetch('/bots/seed', { method: 'POST' })
+                qc.invalidateQueries({ queryKey: ['bots'] })
+              }}
+              className="w-full text-xs py-1.5 border border-t-amber/50 text-t-amber hover:border-t-amber"
+            >
+              ✦ load samples
+            </button>
+          )}
         </div>
       </div>
 

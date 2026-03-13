@@ -1015,3 +1015,191 @@ async def ai_chat(payload: AIChatPayload):
             "output_tokens": response.usage.output_tokens,
         },
     }
+
+
+# ── Sample bots seed ───────────────────────────────────────────────────────────
+_SAMPLE_BOTS = [
+    {
+        "name":        "system_health",
+        "description": "OCI VM 상태 체크 (disk / mem / load). 임계값 초과 시 Discord/Slack 알림.",
+        "schedule":    "*/30 * * * *",
+        "env_json":    "{}",
+        "code": '''\
+# system_health — OCI VM 리소스 모니터링
+# env vars (optional): DISCORD_WEBHOOK or SLACK_WEBHOOK
+import os, shutil, datetime
+
+def fmt(b):
+    for u in ["B","KB","MB","GB"]:
+        if b < 1024: return f"{b:.1f}{u}"
+        b /= 1024
+    return f"{b:.1f}TB"
+
+now   = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+disk  = shutil.disk_usage("/")
+dpct  = disk.used / disk.total * 100
+
+mem   = {}
+try:
+    for line in open("/proc/meminfo"):
+        k, v = line.split(":", 1)
+        mem[k.strip()] = int(v.split()[0]) * 1024
+except Exception:
+    pass
+
+mtotal = mem.get("MemTotal", 0)
+mavail = mem.get("MemAvailable", 0)
+mused  = mtotal - mavail
+mpct   = mused / mtotal * 100 if mtotal else 0
+
+try:
+    load1, load5, load15 = os.getloadavg()
+except Exception:
+    load1 = load5 = load15 = 0.0
+
+print(f"[{now}] SYSTEM HEALTH")
+print(f"  disk : {fmt(disk.used)} / {fmt(disk.total)} ({dpct:.1f}%)")
+print(f"  mem  : {fmt(mused)} / {fmt(mtotal)} ({mpct:.1f}%)")
+print(f"  load : {load1:.2f} / {load5:.2f} / {load15:.2f}  (1m/5m/15m)")
+
+alerts = []
+if dpct  > 80: alerts.append(f"DISK {dpct:.1f}%")
+if mpct  > 85: alerts.append(f"MEM {mpct:.1f}%")
+if load1 >  4: alerts.append(f"LOAD {load1:.2f}")
+
+webhook = os.environ.get("DISCORD_WEBHOOK") or os.environ.get("SLACK_WEBHOOK")
+if alerts and webhook:
+    import urllib.request, json
+    msg  = "⚠️ **OCI VM ALERT** — " + ", ".join(alerts)
+    data = json.dumps({"content": msg}).encode()
+    req  = urllib.request.Request(
+        webhook, data=data, headers={"Content-Type": "application/json"}
+    )
+    urllib.request.urlopen(req, timeout=10)
+    print(f"  alert sent: {', '.join(alerts)}")
+elif alerts:
+    print(f"  ALERTS: {', '.join(alerts)}")
+    print("  tip: set DISCORD_WEBHOOK env var to receive notifications")
+else:
+    print("  status: all OK")
+''',
+    },
+    {
+        "name":        "github_daily_summary",
+        "description": "오늘 GitHub 커밋·PR 활동 집계. 매일 9am UTC 실행.",
+        "schedule":    "0 9 * * *",
+        "env_json":    "{}",
+        "code": '''\
+# github_daily_summary — GitHub 일일 활동 요약
+# env vars: GITHUB_TOKEN, GITHUB_USERNAME
+# (자동으로 /ops > Settings 값을 상속하지 않음 — 봇 env vars에 직접 입력)
+import os, json, datetime, urllib.request
+
+TOKEN    = os.environ.get("GITHUB_TOKEN", "")
+USERNAME = os.environ.get("GITHUB_USERNAME", "")
+
+if not TOKEN or not USERNAME:
+    print("ERROR: GITHUB_TOKEN, GITHUB_USERNAME env vars를 봇 ENV VARS에 설정하세요")
+    raise SystemExit(1)
+
+today = datetime.date.today().isoformat()
+
+req  = urllib.request.Request(
+    f"https://api.github.com/users/{USERNAME}/events?per_page=100",
+    headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"},
+)
+data = json.loads(urllib.request.urlopen(req, timeout=15).read())
+
+commits, prs, comments, repos = 0, 0, 0, set()
+for e in data:
+    if not e.get("created_at", "").startswith(today):
+        continue
+    repos.add(e["repo"]["name"].split("/")[-1])
+    t = e["type"]
+    if t == "PushEvent":
+        commits += len(e["payload"].get("commits", []))
+    elif t == "PullRequestEvent":
+        prs += 1
+    elif t in ("IssueCommentEvent", "CommitCommentEvent"):
+        comments += 1
+
+print(f"[{today}] GitHub Daily — @{USERNAME}")
+print(f"  commits  : {commits}")
+print(f"  PRs      : {prs}")
+print(f"  comments : {comments}")
+print(f"  repos    : {', '.join(sorted(repos)) or '(없음)'}")
+if not repos:
+    print("  오늘은 아직 활동이 없어요 — 코딩할 시간!")
+''',
+    },
+    {
+        "name":        "hn_digest",
+        "description": "Hacker News 상위 10개 기사 수집. Discord 웹훅 선택적 전송.",
+        "schedule":    "0 8 * * *",
+        "env_json":    "{}",
+        "code": '''\
+# hn_digest — Hacker News 상위 10개 기사
+# env vars (optional): DISCORD_WEBHOOK
+import os, json, datetime, urllib.request
+
+def fetch(url):
+    return json.loads(urllib.request.urlopen(url, timeout=10).read())
+
+now     = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+top_ids = fetch("https://hacker-news.firebaseio.com/v0/topstories.json")[:10]
+stories = [fetch(f"https://hacker-news.firebaseio.com/v0/item/{sid}.json") for sid in top_ids]
+
+print(f"[{now}] Hacker News Top 10")
+print()
+
+discord_lines = []
+for i, s in enumerate(stories, 1):
+    title = s.get("title", "?")
+    url   = s.get("url") or f"https://news.ycombinator.com/item?id={s['id']}"
+    score = s.get("score", 0)
+    cmts  = s.get("descendants", 0)
+    print(f"{i:2}. [{score}▲ {cmts}💬] {title}")
+    print(f"     {url}")
+    discord_lines.append(f"**{i}.** `{score}▲` [{title}]({url})")
+
+webhook = os.environ.get("DISCORD_WEBHOOK")
+if webhook:
+    msg  = f"**Hacker News Top 10** — {now}\n\n" + "\n".join(discord_lines[:5])
+    data = json.dumps({"content": msg[:2000]}).encode()
+    req  = urllib.request.Request(
+        webhook, data=data, headers={"Content-Type": "application/json"}
+    )
+    urllib.request.urlopen(req, timeout=10)
+    print("\nDiscord 전송 완료")
+''',
+    },
+]
+
+
+@app.post("/api/bots/seed", status_code=201)
+async def seed_sample_bots():
+    """샘플 봇이 없을 때 기본 봇 3개를 생성합니다."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM bots") as cur:
+            count = (await cur.fetchone())[0]
+    if count > 0:
+        return {"created": 0, "message": "bots already exist — seed skipped"}
+
+    now     = int(time.time() * 1000)
+    created = 0
+    for bot in _SAMPLE_BOTS:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "INSERT INTO bots (name, description, code, schedule, env_json, "
+                "is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                (bot["name"], bot["description"], bot["code"],
+                 bot["schedule"], bot["env_json"], now, now),
+            )
+            await db.commit()
+            async with db.execute("SELECT last_insert_rowid()") as cur:
+                bot_id = (await cur.fetchone())[0]
+        if bot["schedule"]:
+            _schedule_bot(bot_id, bot["schedule"])
+        created += 1
+
+    return {"created": created, "message": f"{created} sample bots created"}
