@@ -13,6 +13,8 @@ interface BotRun {
   stdout_preview?: string; stdout?: string; stderr: string
 }
 interface Setting { key: string; is_set: boolean; display: string; masked: boolean }
+interface BotDataEntry { value: unknown; updated_at: number }
+interface BotData { [key: string]: BotDataEntry }
 interface ContribDay { date: string; contributionCount: number }
 interface ContribWeek { contributionDays: ContribDay[] }
 interface GitActivity { totalContributions: number; weeks: ContribWeek[] }
@@ -319,6 +321,80 @@ function RunLog({ run }: { run: BotRun }) {
   )
 }
 
+// ── BOT DATA PANEL ────────────────────────────────────────────────────────────
+function BotDataPanel({ botId, data }: { botId: number; data: BotData }) {
+  const [copiedKey, setCopiedKey] = useState<string | null>(null)
+  const [expandedKey, setExpandedKey] = useState<string | null>(null)
+  const apiBase = window.location.origin
+
+  const copy = (text: string, key: string) => {
+    navigator.clipboard.writeText(text)
+    setCopiedKey(key)
+    setTimeout(() => setCopiedKey(null), 1500)
+  }
+
+  return (
+    <div className="border-t border-t-border shrink-0 flex flex-col">
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-t-border">
+        <span className="text-t-green text-[10px]">◈</span>
+        <p className="text-xs text-t-muted tracking-widest">BOT DATA</p>
+        <span className="text-[10px] text-t-muted ml-auto">REST API · public read</span>
+      </div>
+      <div className="overflow-y-auto max-h-56 divide-y divide-t-border/50">
+        {Object.entries(data).map(([key, entry]) => {
+          const url     = `${apiBase}/api/bots/${botId}/data`
+          const val     = entry.value
+          const isObj   = typeof val === 'object' && val !== null
+          const preview = isObj
+            ? JSON.stringify(val).slice(0, 120)
+            : String(val)
+          const expanded = expandedKey === key
+
+          return (
+            <div key={key} className="px-3 py-2">
+              <div className="flex items-center gap-2">
+                <span className="text-t-green font-mono text-[10px] tracking-wider">
+                  {key === 'default' ? 'data' : key}
+                </span>
+                <span className="text-[10px] text-t-muted ml-auto">{timeAgo(entry.updated_at)}</span>
+                <button
+                  onClick={() => setExpandedKey(expanded ? null : key)}
+                  className="text-[10px] text-t-muted hover:text-t-text px-1"
+                  title="expand"
+                >
+                  {expanded ? '▲' : '▼'}
+                </button>
+                <button
+                  onClick={() => copy(url + (key !== 'default' ? `?key=${key}` : ''), `url-${key}`)}
+                  className="text-[10px] text-t-dim hover:text-t-green border border-t-border/50 px-1.5 py-0.5"
+                  title="copy API URL"
+                >
+                  {copiedKey === `url-${key}` ? '✓ copied' : '⧉ URL'}
+                </button>
+                <button
+                  onClick={() => copy(JSON.stringify(val, null, 2), `val-${key}`)}
+                  className="text-[10px] text-t-dim hover:text-t-green border border-t-border/50 px-1.5 py-0.5"
+                >
+                  {copiedKey === `val-${key}` ? '✓' : '{ }'}
+                </button>
+              </div>
+
+              {expanded ? (
+                <pre className="mt-1.5 text-[10px] text-t-green bg-black/40 border border-t-border
+                                p-2 overflow-auto max-h-40 leading-4 font-mono">
+                  {JSON.stringify(val, null, 2)}
+                </pre>
+              ) : (
+                <p className="mt-0.5 text-[10px] text-t-dim font-mono truncate">{preview}</p>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 // ── BOTS PANEL ────────────────────────────────────────────────────────────────
 function BotsPanel() {
   const qc = useQueryClient()
@@ -391,6 +467,13 @@ function BotsPanel() {
 
   const hasActive = runs.some((r: BotRun) => r.status === 'running' || r.status === 'pending')
 
+  const { data: botData } = useQuery<BotData>({
+    queryKey: ['bot-data', selectedId],
+    queryFn:  () => apiFetch(`/bots/${selectedId}/data`),
+    enabled:  selectedId !== null && !isNew,
+    refetchInterval: 10000,
+  })
+
   return (
     <div className="flex h-full min-h-0 gap-0">
       {/* ── Left: bot list ── */}
@@ -456,7 +539,7 @@ function BotsPanel() {
 
             {/* run history */}
             {selectedId !== null && !isNew && (
-              <div className="border-t border-t-border shrink-0 max-h-56 flex flex-col">
+              <div className="border-t border-t-border shrink-0 max-h-48 flex flex-col">
                 <div className="flex items-center gap-2 px-3 py-2 border-b border-t-border">
                   <p className="text-xs text-t-muted tracking-widest">RUN HISTORY</p>
                   {hasActive && <span className="text-t-amber text-xs animate-pulse">● running</span>}
@@ -470,6 +553,11 @@ function BotsPanel() {
                   )}
                 </div>
               </div>
+            )}
+
+            {/* data panel */}
+            {selectedId !== null && !isNew && botData && Object.keys(botData).length > 0 && (
+              <BotDataPanel botId={selectedId} data={botData} />
             )}
           </>
         ) : (

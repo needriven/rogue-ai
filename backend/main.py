@@ -112,6 +112,16 @@ async def init_db() -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_bot_runs_bot ON bot_runs(bot_id, started_at DESC)"
         )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_data (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id     INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+                key        TEXT    NOT NULL DEFAULT 'default',
+                value_json TEXT    NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL,
+                UNIQUE(bot_id, key)
+            )
+        """)
         await db.commit()
 
 
@@ -307,7 +317,12 @@ async def _run_bot_task(run_id: int, bot_id: int, code: str, env_extras: dict) -
         )
         await db.commit()
 
-    merged_env = {**os.environ, **{k: str(v) for k, v in env_extras.items()}}
+    merged_env = {
+        **os.environ,
+        **{k: str(v) for k, v in env_extras.items()},
+        "BOT_ID":       str(bot_id),
+        "BOT_API_BASE": "http://localhost:8000/api",
+    }
     stdout_str = stderr_str = ""
     exit_code  = -1
     status     = "error"
@@ -885,6 +900,44 @@ async def get_bot_run(run_id: int):
     return dict(row)
 
 
+# ── Bot data (REST publish) ─────────────────────────────────────────────────────
+@app.post("/api/bots/{bot_id}/data", status_code=204)
+async def store_bot_data(bot_id: int, request: Request, key: str = Query("default")):
+    """Bots call this via BOT_API_BASE to publish structured JSON results."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+    now = int(time.time() * 1000)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT INTO bot_data (bot_id, key, value_json, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(bot_id, key) DO UPDATE SET value_json=excluded.value_json, "
+            "updated_at=excluded.updated_at",
+            (bot_id, key, json.dumps(body), now),
+        )
+        await db.commit()
+
+
+@app.get("/api/bots/{bot_id}/data")
+async def get_bot_data(bot_id: int):
+    """Return all stored data keys for a bot. CORS-open for external web services."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT key, value_json, updated_at FROM bot_data WHERE bot_id=? ORDER BY key",
+            (bot_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return {
+        r["key"]: {
+            "value":      json.loads(r["value_json"]),
+            "updated_at": r["updated_at"],
+        }
+        for r in rows
+    }
+
+
 # ── GitHub routes ──────────────────────────────────────────────────────────────
 @app.get("/api/github/activity")
 async def github_activity():
@@ -1271,6 +1324,31 @@ def load_state() -> dict:
     except: return {}
 def save_state(s: dict):
     open(STATE_FILE, "w").write(json.dumps(s))
+```
+
+## Publish data as REST API (web-accessible)
+```python
+import os, json, urllib.request
+BOT_ID       = os.environ.get("BOT_ID", "")
+BOT_API_BASE = os.environ.get("BOT_API_BASE", "http://localhost:8000/api")
+
+def store_data(data: dict, key: str = "default"):
+    """Save structured JSON so it's readable via GET /api/bots/{BOT_ID}/data
+    External services can poll this endpoint to consume bot output."""
+    if not BOT_ID:
+        print("[store_data] BOT_ID not set — skipping")
+        return
+    body = json.dumps(data).encode()
+    req  = urllib.request.Request(
+        f"{BOT_API_BASE}/bots/{BOT_ID}/data?key={key}",
+        data=body, headers={"Content-Type": "application/json"}, method="POST",
+    )
+    urllib.request.urlopen(req, timeout=5)
+
+# Example usage:
+# store_data({"price": 42000, "symbol": "BTC", "change_pct": -1.5})
+# store_data({"items": [...]}, key="feed")
+# store_data({"disk_pct": 61.2, "mem_pct": 43.0}, key="health")
 ```
 
 ## Cron schedule examples
