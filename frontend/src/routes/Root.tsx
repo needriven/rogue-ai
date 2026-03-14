@@ -4,19 +4,53 @@ import { useGameState } from '@/hooks/useGameState'
 import { GameContext } from '@/context/GameContext'
 import OfflineModal from '@/components/OfflineModal'
 
-const NAV_ITEMS = [
-  { to: '/',          label: 'HOME',      icon: '~',  exact: true  },
-  { to: '/game',      label: 'GAME',      icon: '▶',  exact: false },
-  { to: '/feed',      label: 'FEED',      icon: '◈',  exact: false },
-  { to: '/network',   label: 'NETWORK',   icon: '⬡',  exact: false },
-  { to: '/monitor',   label: 'MONITOR',   icon: '◎',  exact: false },
-  { to: '/analytics', label: 'ANALYTICS', icon: '▲',  exact: false },
-  { to: '/planner',   label: 'PLANNER',   icon: '◷',  exact: false },
-  { to: '/term',      label: 'TERM',      icon: '$',  exact: false },
-  { to: '/ops',       label: 'OPS',       icon: '⌬',  exact: false },
-  { to: '/settings',  label: 'SETTINGS',  icon: '⚙',  exact: false },
-] as const
+// ── Nav structure ─────────────────────────────────────────────────────────────
+interface NavEntry {
+  to:    string
+  label: string
+  icon:  string
+  exact: boolean
+}
 
+interface NavGroup {
+  id:      string
+  label:   string
+  items:   NavEntry[]
+}
+
+const NAV_HOME: NavEntry = { to: '/', label: 'HOME', icon: '~', exact: true }
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    id:    'game',
+    label: 'GAME',
+    items: [
+      { to: '/game',      label: 'PLAY',      icon: '▶', exact: false },
+      { to: '/network',   label: 'NETWORK',   icon: '⬡', exact: false },
+      { to: '/analytics', label: 'ANALYTICS', icon: '▲', exact: false },
+    ],
+  },
+  {
+    id:    'services',
+    label: 'SERVICES',
+    items: [
+      { to: '/feed',    label: 'FEED',    icon: '◈', exact: false },
+      { to: '/monitor', label: 'MONITOR', icon: '◎', exact: false },
+      { to: '/planner', label: 'PLANNER', icon: '◷', exact: false },
+    ],
+  },
+  {
+    id:    'system',
+    label: 'SYSTEM',
+    items: [
+      { to: '/term',     label: 'TERM',     icon: '$', exact: false },
+      { to: '/ops',      label: 'OPS',      icon: '⌬', exact: false },
+      { to: '/settings', label: 'SETTINGS', icon: '⚙', exact: false },
+    ],
+  },
+]
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
 function formatUptime(s: number): string {
   const h   = Math.floor(s / 3600).toString().padStart(2, '0')
   const m   = Math.floor((s % 3600) / 60).toString().padStart(2, '0')
@@ -24,9 +58,16 @@ function formatUptime(s: number): string {
   return `${h}:${m}:${sec}`
 }
 
-function NavItem({ to, label, icon, exact, alertCount = 0 }: {
-  to: string; label: string; icon: string; exact: boolean; alertCount?: number
-}) {
+function loadCollapsed(): Record<string, boolean> {
+  try {
+    return JSON.parse(localStorage.getItem('nav-collapsed') ?? '{}')
+  } catch {
+    return {}
+  }
+}
+
+// ── NavItem ───────────────────────────────────────────────────────────────────
+function NavItem({ to, label, icon, exact, alertCount = 0 }: NavEntry & { alertCount?: number }) {
   const match    = useMatchRoute()
   const isActive = !!match({ to, fuzzy: !exact })
 
@@ -34,7 +75,7 @@ function NavItem({ to, label, icon, exact, alertCount = 0 }: {
     <Link
       to={to}
       className={[
-        'group flex items-center gap-3 px-4 py-2.5 text-xs tracking-widest',
+        'group flex items-center gap-2.5 pl-7 pr-4 py-2 text-xs tracking-widest',
         'transition-all duration-150 border-l-2',
         isActive
           ? 'border-t-green text-t-green bg-t-green-glow'
@@ -42,29 +83,88 @@ function NavItem({ to, label, icon, exact, alertCount = 0 }: {
       ].join(' ')}
     >
       <span className={[
-        'w-4 text-center transition-colors duration-150 text-sm leading-none relative',
+        'w-3.5 text-center text-[11px] leading-none relative shrink-0',
         isActive ? 'text-t-green' : 'text-t-muted group-hover:text-t-dim',
       ].join(' ')}>
         {icon}
         {alertCount > 0 && (
-          <span className="absolute -top-1 -right-1 w-1.5 h-1.5 rounded-full bg-t-red" />
+          <span className="absolute -top-0.5 -right-1 w-1.5 h-1.5 rounded-full bg-t-red animate-glow-pulse" />
         )}
       </span>
-      <span>{label}</span>
+      <span className="truncate">{label}</span>
       {isActive && (
-        <span className="ml-auto w-1 h-1 rounded-full bg-t-green animate-glow-pulse" />
+        <span className="ml-auto w-1 h-1 rounded-full bg-t-green animate-glow-pulse shrink-0" />
       )}
     </Link>
   )
 }
 
+// ── NavGroup ──────────────────────────────────────────────────────────────────
+function NavGroupSection({
+  group, collapsed, onToggle, alertCount, hasActive,
+}: {
+  group:      NavGroup
+  collapsed:  boolean
+  onToggle:   (id: string) => void
+  alertCount: Record<string, number>
+  hasActive:  boolean
+}) {
+  const groupAlerts = group.items.reduce((sum, item) => sum + (alertCount[item.to] ?? 0), 0)
+
+  return (
+    <div>
+      {/* Section header / toggle */}
+      <button
+        onClick={() => onToggle(group.id)}
+        className={[
+          'w-full flex items-center gap-2 px-3 py-2 text-[10px] tracking-[0.2em]',
+          'transition-colors border-l-2',
+          hasActive && !collapsed
+            ? 'border-transparent text-t-green/70'
+            : 'border-transparent text-t-muted hover:text-t-dim',
+        ].join(' ')}
+      >
+        {/* Collapse arrow */}
+        <span className={`transition-transform duration-200 text-[8px] ${collapsed ? '' : 'rotate-90'}`}>
+          ▶
+        </span>
+        <span className="font-semibold">{group.label}</span>
+        {groupAlerts > 0 && (
+          <span className="ml-1 w-1.5 h-1.5 rounded-full bg-t-red animate-glow-pulse" />
+        )}
+        {/* Active indicator dot when collapsed */}
+        {hasActive && collapsed && (
+          <span className="ml-auto w-1 h-1 rounded-full bg-t-green/60" />
+        )}
+      </button>
+
+      {/* Items */}
+      {!collapsed && (
+        <div className="pb-1">
+          {group.items.map(item => (
+            <NavItem
+              key={item.to}
+              {...item}
+              alertCount={alertCount[item.to] ?? 0}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Root ──────────────────────────────────────────────────────────────────────
 export default function Root() {
-  const [uptime,      setUptime]      = useState(0)
-  const [alertCount,  setAlertCount]  = useState(
+  const [uptime,     setUptime]     = useState(0)
+  const [alertCount, setAlertCount] = useState(
     () => parseInt(localStorage.getItem('planner-alert-count') ?? '0', 10)
   )
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(loadCollapsed)
+
   const game = useGameState()
   const { state, dismissOfflineReport } = game
+  const match = useMatchRoute()
 
   useEffect(() => {
     const start = Date.now()
@@ -80,15 +180,41 @@ export default function Root() {
     return () => window.removeEventListener('planner-alert', handler)
   }, [])
 
+  const toggleGroup = (id: string) => {
+    setCollapsed(prev => {
+      const next = { ...prev, [id]: !prev[id] }
+      localStorage.setItem('nav-collapsed', JSON.stringify(next))
+      return next
+    })
+  }
+
+  // Per-route alert counts
+  const routeAlerts: Record<string, number> = {
+    '/planner': alertCount,
+  }
+
+  // Which group contains the currently active route
+  const activeGroupId = NAV_GROUPS.find(g =>
+    g.items.some(item => !!match({ to: item.to, fuzzy: true }))
+  )?.id
+
+  // Auto-expand the group that has the active route
+  useEffect(() => {
+    if (activeGroupId && collapsed[activeGroupId]) {
+      setCollapsed(prev => {
+        const next = { ...prev, [activeGroupId]: false }
+        localStorage.setItem('nav-collapsed', JSON.stringify(next))
+        return next
+      })
+    }
+  }, [activeGroupId]) // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <div className="scanlines flex flex-col h-screen bg-t-bg font-mono overflow-hidden">
 
       {/* Offline modal */}
       {state.offlineReport && (
-        <OfflineModal
-          report={state.offlineReport}
-          onDismiss={dismissOfflineReport}
-        />
+        <OfflineModal report={state.offlineReport} onDismiss={dismissOfflineReport} />
       )}
 
       {/* ── Top bar ──────────────────────────────────────────────── */}
@@ -112,9 +238,10 @@ export default function Root() {
           </span>
           <span className="text-t-muted">//</span>
           <span>
-            CPS: <span className="text-t-green tabular-nums">
+            CPS:{' '}
+            <span className="text-t-green tabular-nums">
               {state.cyclesPerSecond >= 1
-                ? `${(state.cyclesPerSecond).toFixed(1)}/s`
+                ? `${state.cyclesPerSecond.toFixed(1)}/s`
                 : 'IDLE'}
             </span>
           </span>
@@ -132,26 +259,60 @@ export default function Root() {
       {/* ── Body ─────────────────────────────────────────────────── */}
       <div className="flex flex-1 min-h-0">
 
-        <aside className="w-44 shrink-0 border-r border-t-border bg-t-panel/60 flex flex-col py-3 gap-0.5">
-          {NAV_ITEMS.map(item => (
-            <NavItem
-              key={item.to}
-              {...item}
-              alertCount={item.to === '/planner' ? alertCount : 0}
-            />
-          ))}
+        {/* ── Sidebar ────────────────────────────────────────────── */}
+        <aside className="w-44 shrink-0 border-r border-t-border bg-t-panel/60
+                          flex flex-col overflow-y-auto">
 
-          <div className="px-4 py-2.5 flex items-center gap-3 opacity-25 cursor-not-allowed select-none">
-            <span className="w-4 text-center text-xs text-t-muted">+</span>
-            <span className="text-xs text-t-muted tracking-widest">LOCKED</span>
+          {/* HOME — standalone */}
+          <div className="pt-3 pb-1">
+            <Link
+              to={NAV_HOME.to}
+              className={[
+                'group flex items-center gap-2.5 px-4 py-2.5 text-xs tracking-widest',
+                'transition-all duration-150 border-l-2',
+                !!match({ to: NAV_HOME.to, fuzzy: false })
+                  ? 'border-t-green text-t-green bg-t-green-glow'
+                  : 'border-transparent text-t-dim hover:text-t-text hover:border-t-border',
+              ].join(' ')}
+            >
+              <span className={[
+                'w-4 text-center text-sm leading-none',
+                !!match({ to: NAV_HOME.to, fuzzy: false }) ? 'text-t-green' : 'text-t-muted group-hover:text-t-dim',
+              ].join(' ')}>
+                {NAV_HOME.icon}
+              </span>
+              <span>{NAV_HOME.label}</span>
+              {!!match({ to: NAV_HOME.to, fuzzy: false }) && (
+                <span className="ml-auto w-1 h-1 rounded-full bg-t-green animate-glow-pulse" />
+              )}
+            </Link>
           </div>
 
-          <div className="mt-auto px-4 py-3 border-t border-t-border">
-            <p className="text-xs text-t-muted">v0.1.0-alpha</p>
-            <p className="text-xs text-t-muted mt-0.5">needriven</p>
+          {/* Divider */}
+          <div className="mx-4 border-t border-t-border/50" />
+
+          {/* Grouped sections */}
+          <div className="flex-1 py-2 space-y-0.5">
+            {NAV_GROUPS.map(group => (
+              <NavGroupSection
+                key={group.id}
+                group={group}
+                collapsed={!!collapsed[group.id]}
+                onToggle={toggleGroup}
+                alertCount={routeAlerts}
+                hasActive={group.id === activeGroupId}
+              />
+            ))}
+          </div>
+
+          {/* Footer */}
+          <div className="px-4 py-3 border-t border-t-border shrink-0">
+            <p className="text-[10px] text-t-muted">v0.1.0-alpha</p>
+            <p className="text-[10px] text-t-muted mt-0.5">needriven</p>
           </div>
         </aside>
 
+        {/* ── Main content ─────────────────────────────────────── */}
         <main className="flex-1 min-w-0 overflow-auto bg-t-bg">
           <GameContext.Provider value={game}>
             <Outlet />
