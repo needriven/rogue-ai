@@ -1384,8 +1384,8 @@ BOT_ID       = os.environ.get("BOT_ID", "")
 BOT_API_BASE = os.environ.get("BOT_API_BASE", "http://localhost:8000/api")
 
 def store_data(data: dict, key: str = "default"):
-    """Save structured JSON so it's readable via GET /api/bots/{BOT_ID}/data
-    External services can poll this endpoint to consume bot output."""
+    # Save structured JSON so it's readable via GET /api/bots/{BOT_ID}/data
+    # External services can poll this endpoint to consume bot output.
     if not BOT_ID:
         print("[store_data] BOT_ID not set — skipping")
         return
