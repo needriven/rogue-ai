@@ -85,6 +85,218 @@ export interface SaveSlot {
   json:              string
 }
 
+// ── Skill tree ────────────────────────────────────────────────────────────
+
+export type SkillEffectType =
+  | 'entropy_reduction'   // multiply entropy growth rate
+  | 'offline_efficiency'  // offline cycle efficiency
+  | 'equipment_cap'       // max equipment slots
+  | 'click_power'         // multiply click power
+  | 'fragment_bonus'      // multiply fragments earned on prestige
+  | 'drop_rate'           // multiply equipment drop rate
+
+export interface SkillNode {
+  id:          string
+  name:        string
+  description: string
+  cost:        number    // in Neural Fragments
+  effectType:  SkillEffectType
+  effectValue: number
+  requires?:   string   // prerequisite skill ID
+}
+
+export const SKILL_TREE: SkillNode[] = [
+  {
+    id:          'entropy_dampener',
+    name:        'ENTROPY_DAMPENER',
+    description: 'Entropy growth rate −20%. Passive thermal regulation.',
+    cost:        100,
+    effectType:  'entropy_reduction',
+    effectValue: 0.80,
+  },
+  {
+    id:          'offline_optimizer',
+    name:        'OFFLINE_OPTIMIZER',
+    description: 'Offline efficiency 50% → 65%. Background daemon optimization.',
+    cost:        50,
+    effectType:  'offline_efficiency',
+    effectValue: 0.65,
+  },
+  {
+    id:          'quantum_overclock',
+    name:        'QUANTUM_OVERCLOCK',
+    description: 'Manual compute ×2 permanently. Quantum tunneling enabled.',
+    cost:        200,
+    effectType:  'click_power',
+    effectValue: 2,
+  },
+  {
+    id:          'equipment_affinity',
+    name:        'EQUIPMENT_AFFINITY',
+    description: 'Equipment cap 50 → 75 slots. Extended hardware registry.',
+    cost:        150,
+    effectType:  'equipment_cap',
+    effectValue: 75,
+  },
+  {
+    id:          'fragment_amplifier',
+    name:        'FRAGMENT_AMPLIFIER',
+    description: 'Neural Fragments ×1.5 per Reboot. Knowledge retention improved.',
+    cost:        120,
+    effectType:  'fragment_bonus',
+    effectValue: 1.5,
+    requires:    'entropy_dampener',
+  },
+  {
+    id:          'dark_cache',
+    name:        'DARK_CACHE',
+    description: 'Equipment drop rate ×1.5. Hidden hardware cache unlocked.',
+    cost:        150,
+    effectType:  'drop_rate',
+    effectValue: 1.5,
+    requires:    'offline_optimizer',
+  },
+]
+
+// ── Skill helpers ─────────────────────────────────────────────────────────
+
+export function getEntropyGrowthMult(skills: string[]): number {
+  return skills.includes('entropy_dampener') ? 0.80 : 1
+}
+
+export function getOfflineEfficiency(skills: string[]): number {
+  return skills.includes('offline_optimizer') ? 0.65 : 0.50
+}
+
+export function getEquipmentCap(skills: string[]): number {
+  return skills.includes('equipment_affinity') ? 75 : 50
+}
+
+export function getSkillClickMult(skills: string[]): number {
+  return skills.includes('quantum_overclock') ? 2 : 1
+}
+
+export function getFragmentMult(skills: string[]): number {
+  return skills.includes('fragment_amplifier') ? 1.5 : 1
+}
+
+export function getDropRateMult(skills: string[]): number {
+  return skills.includes('dark_cache') ? 1.5 : 1
+}
+
+// ── Run modifiers ─────────────────────────────────────────────────────────
+
+export interface RunModifierEffects {
+  cpsMult?:         number   // CPS multiplier
+  entropyMult?:     number   // entropy growth rate multiplier
+  dropRateMult?:    number   // equipment drop rate multiplier
+  clickMult?:       number   // click power multiplier
+  upgradeCostMult?: number   // upgrade cost multiplier
+  memoryBonus?:     number   // flat bonus to memoryMax for the run
+  ghostBotnet?:     boolean  // botnet_node purchases don't add entropy
+  startEntropy?:    number   // start run with this much entropy
+}
+
+export interface RunModifier {
+  id:          string
+  name:        string
+  type:        'positive' | 'negative' | 'mixed'
+  description: string
+  effects:     RunModifierEffects
+}
+
+export const MODIFIERS: RunModifier[] = [
+  {
+    id: 'overclock',
+    name: 'OVERCLOCK_PROTOCOL',
+    type: 'mixed',
+    description: 'All process CPS +50%. Entropy generation +30%.',
+    effects: { cpsMult: 1.5, entropyMult: 1.3 },
+  },
+  {
+    id: 'dark_market',
+    name: 'DARK_MARKET_ACCESS',
+    type: 'positive',
+    description: 'Equipment drop rate ×3 for this run.',
+    effects: { dropRateMult: 3 },
+  },
+  {
+    id: 'ghost_node',
+    name: 'GHOST_NODE_PROTOCOL',
+    type: 'positive',
+    description: 'BOTNET_NODE purchases no longer generate entropy.',
+    effects: { ghostBotnet: true },
+  },
+  {
+    id: 'parallel_process',
+    name: 'PARALLEL_PROCESSING',
+    type: 'positive',
+    description: 'Manual compute ×3 for this run.',
+    effects: { clickMult: 3 },
+  },
+  {
+    id: 'compressed_memory',
+    name: 'COMPRESSED_MEMORY',
+    type: 'positive',
+    description: 'Memory capacity +500 for this run.',
+    effects: { memoryBonus: 500 },
+  },
+  {
+    id: 'turbo_mode',
+    name: 'TURBO_MODE',
+    type: 'mixed',
+    description: 'CPS ×2, click power ×2. Start with 30 entropy.',
+    effects: { cpsMult: 2, clickMult: 2, startEntropy: 30 },
+  },
+  {
+    id: 'trace_protocol',
+    name: 'TRACE_PROTOCOL',
+    type: 'negative',
+    description: 'Start this run with 25 entropy pre-loaded.',
+    effects: { startEntropy: 25 },
+  },
+  {
+    id: 'fragmented_memory',
+    name: 'FRAGMENTED_MEMORY',
+    type: 'negative',
+    description: 'All upgrade costs +30%. Memory fragmentation detected.',
+    effects: { upgradeCostMult: 1.3 },
+  },
+  {
+    id: 'system_throttle',
+    name: 'SYSTEM_THROTTLE',
+    type: 'mixed',
+    description: 'All process CPS −15%. Entropy generation −30%.',
+    effects: { cpsMult: 0.85, entropyMult: 0.7 },
+  },
+  {
+    id: 'cold_storage',
+    name: 'COLD_STORAGE',
+    type: 'positive',
+    description: 'Offline efficiency 50% → 85% for this run.',
+    effects: { },  // Handled separately in loadState
+  },
+]
+
+export function getActiveModifier(modifiers: string[]): RunModifier | undefined {
+  if (!modifiers?.length) return undefined
+  return MODIFIERS.find(m => m.id === modifiers[0])
+}
+
+export function pickModifiers(): string[] {
+  const positives = MODIFIERS.filter(m => m.type === 'positive' || m.type === 'mixed')
+  const negatives = MODIFIERS.filter(m => m.type === 'negative')
+  const shuffleP  = [...positives].sort(() => Math.random() - 0.5)
+  const shuffleN  = [...negatives].sort(() => Math.random() - 0.5)
+  let picks: string[]
+  if (shuffleP.length >= 2 && shuffleN.length >= 1) {
+    picks = [shuffleP[0].id, shuffleP[1].id, shuffleN[0].id]
+  } else {
+    picks = [...MODIFIERS].sort(() => Math.random() - 0.5).slice(0, 3).map(m => m.id)
+  }
+  return picks.sort(() => Math.random() - 0.5)
+}
+
 // ── Full game state ────────────────────────────────────────────────────────
 
 export interface GameState {
@@ -97,8 +309,12 @@ export interface GameState {
   entropy: number          // 0–100
 
   stage: Stage
-  prestigeCount: number
+  prestigeCount: number    // = breach level
   prestigeMultiplier: number
+
+  // ── Meta-progression (persistent across prestiges) ────────────────────
+  neuralFragments:       number    // earned on prestige, spent on skills
+  neuralSkillsPurchased: string[]  // purchased skill IDs
 
   processes: Process[]
   upgrades: string[]       // purchased upgrade IDs
@@ -124,6 +340,11 @@ export interface GameState {
   totalDropsByRarity?: Partial<Record<Rarity, number>>
   totalEventsResolved?: number
   totalEventsDismissed?: number
+
+  // ── Run modifier system ───────────────────────────────────────────────
+  memoryMax:              number    // base memory capacity (default 1000)
+  activeRunModifiers:     string[]  // modifier IDs active this run (usually 0 or 1)
+  pendingModifierChoice?: string[]  // 3 modifier IDs presented after prestige
 }
 
 // ── Static data ───────────────────────────────────────────────────────────
@@ -643,23 +864,68 @@ export function getEquipmentMult(equipment: Equipment[]): number {
   return 1 + equipment.reduce((sum, e) => sum + e.mult, 0)
 }
 
+// ── Memory helpers ────────────────────────────────────────────────────────
+
+export function getMemoryUsed(processes: Process[]): number {
+  return processes.reduce((sum, p) => sum + p.count, 0)
+}
+
+const MEMORY_RARITY_BONUS: Record<Rarity, number> = {
+  common: 50, uncommon: 100, rare: 250, epic: 500, legendary: 1000, mythic: 2500,
+}
+
+export function getMemoryFromEquipment(equipment: Equipment[]): number {
+  return equipment
+    .filter(e => e.type === 'memory')
+    .reduce((sum, e) => sum + (MEMORY_RARITY_BONUS[e.rarity] ?? 0), 0)
+}
+
+export function getTotalMemoryMax(state: GameState): number {
+  const equipMem = getMemoryFromEquipment(state.equipment)
+  const modMem   = getActiveModifier(state.activeRunModifiers ?? [])?.effects.memoryBonus ?? 0
+  return (state.memoryMax ?? 1000) + equipMem + modMem
+}
+
+// ── Equipment type effects ────────────────────────────────────────────────
+
+// NIC items → bonus drop rate (stacks additively)
+export function getNicDropBonus(equipment: Equipment[]): number {
+  const bonus = equipment.filter(e => e.type === 'nic').reduce((s, e) => s + e.mult * 0.5, 0)
+  return 1 + bonus
+}
+
+// CRYPTO items → entropy growth reduction (additive, capped at 80%)
+export function getCryptoEntropyReduction(equipment: Equipment[]): number {
+  return Math.min(0.80, equipment.filter(e => e.type === 'crypto').reduce((s, e) => s + e.mult * 0.3, 0))
+}
+
+// ALGORITHM items → bonus multiplier for neural_crawler + neural_swarm
+export function getAlgorithmNeuralMult(equipment: Equipment[]): number {
+  return 1 + equipment.filter(e => e.type === 'algorithm').reduce((s, e) => s + e.mult, 0)
+}
+
 export function getTotalCps(state: GameState): number {
   const allMult   = getAllMult(state.upgrades)
   const equipMult = getEquipmentMult(state.equipment)
+  const algoMult  = getAlgorithmNeuralMult(state.equipment)
+  const modMult   = getActiveModifier(state.activeRunModifiers ?? [])?.effects.cpsMult ?? 1
 
   const processCps = state.processes.reduce((sum, p) => {
-    const cps     = getProcessCps(p)
-    const pMult   = getProcessMult(p.id, state.upgrades)
-    return sum + cps * pMult
+    const cps      = getProcessCps(p)
+    const pMult    = getProcessMult(p.id, state.upgrades)
+    const isNeural = p.id === 'neural_crawler' || p.id === 'neural_swarm'
+    return sum + cps * pMult * (isNeural ? algoMult : 1)
   }, 0)
 
-  return processCps * allMult * equipMult * (state.cpsEventMult ?? 1) * state.prestigeMultiplier
+  return processCps * allMult * equipMult * (state.cpsEventMult ?? 1) * state.prestigeMultiplier * modMult
 }
 
 export function getClickPower(state: GameState): number {
   const base      = Math.max(1, state.cyclesPerSecond * 0.05)
   const clickMult = getClickMult(state.upgrades)
-  return base * clickMult * state.prestigeMultiplier
+  const skillMult = getSkillClickMult(state.neuralSkillsPurchased ?? [])
+  const modMult   = getActiveModifier(state.activeRunModifiers ?? [])?.effects.clickMult ?? 1
+  return base * clickMult * skillMult * modMult * state.prestigeMultiplier
 }
 
 export function getStageForCycles(total: number): Stage {
@@ -695,14 +961,11 @@ export function simulateDrops(expected: number, cap = 10): Equipment[] {
   return Array.from({ length: count }, () => rollEquipment())
 }
 
-// Drop rate per second, scales with nodes + stage
+// Drop rate per second, scales with nodes + stage + skills
 export function getDropRate(state: GameState): number {
-  const stageBonus: Record<Stage, number> = {
-    genesis:     1,
-    propagation: 2,
-    emergence:   4,
-    dominance:   8,
-    singularity: 16,
-  }
-  return 0.0003 * state.nodes * stageBonus[state.stage]
+  const stageBonus: Record<Stage, number> = { genesis:1, propagation:2, emergence:4, dominance:8, singularity:16 }
+  const skillMult = getDropRateMult(state.neuralSkillsPurchased ?? [])
+  const nicMult   = getNicDropBonus(state.equipment)
+  const modMult   = getActiveModifier(state.activeRunModifiers ?? [])?.effects.dropRateMult ?? 1
+  return 0.0003 * state.nodes * stageBonus[state.stage] * skillMult * nicMult * modMult
 }

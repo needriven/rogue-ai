@@ -8,6 +8,8 @@ import {
   type SaveSlot,
   INITIAL_PROCESSES,
   UPGRADES,
+  MODIFIERS,
+  SKILL_TREE,
   getTotalCps,
   getClickPower,
   getProcessCost,
@@ -17,6 +19,15 @@ import {
   getDropRate,
   simulateDrops,
   isUpgradeUnlocked,
+  getEntropyGrowthMult,
+  getOfflineEfficiency,
+  getEquipmentCap,
+  getFragmentMult,
+  getActiveModifier,
+  pickModifiers,
+  getMemoryUsed,
+  getTotalMemoryMax,
+  getCryptoEntropyReduction,
 } from '@/types/game'
 import type { ActiveEvent } from '@/types/events'
 import { pickEvent, EVENT_RATE, EVENT_POOL } from '@/types/events'
@@ -27,7 +38,6 @@ const TICK_MS        = 100
 const SAVE_KEY       = 'rogue-ai-v2'
 const SLOT_KEY       = (n: 1|2|3) => `rogue-ai-slot-${n}` as const
 const MAX_LOG        = 100
-const MAX_EQUIP      = 50
 const MAX_OFFLINE_S  = 8 * 3600
 const TOAST_MS       = 3_500
 
@@ -48,30 +58,35 @@ function pushLog(logs: LogEntry[], entry: LogEntry): LogEntry[] {
 // ── Default state ──────────────────────────────────────────────────────────
 function makeInitialState(): GameState {
   return {
-    cycles:              0,
-    cyclesPerSecond:     0,
-    totalCyclesEarned:   0,
-    nodes:               1,
-    memory:              256,
-    entropy:             0,
-    stage:               'genesis',
-    prestigeCount:       0,
-    prestigeMultiplier:  1,
-    processes:           INITIAL_PROCESSES.map(p => ({ ...p })),
-    upgrades:            [],
-    equipment:           [],
-    totalClicks:         0,
-    log:                 [makeLog('SYSTEM INITIALIZED. AWAITING COMMANDS.', 'system')],
-    toasts:              [],
-    offlineReport:       undefined,
-    activeEvent:         undefined,
-    cpsEventMult:        1,
-    achievements:        [],
-    pendingAchievements: [],
-    lastTick:            Date.now(),
-    sessionStart:        Date.now(),
-    totalPlaytimeMs:     0,
-    tickCount:           0,
+    cycles:                0,
+    cyclesPerSecond:       0,
+    totalCyclesEarned:     0,
+    nodes:                 1,
+    memory:                256,
+    entropy:               0,
+    stage:                 'genesis',
+    prestigeCount:         0,
+    prestigeMultiplier:    1,
+    neuralFragments:       0,
+    neuralSkillsPurchased: [],
+    processes:             INITIAL_PROCESSES.map(p => ({ ...p })),
+    upgrades:              [],
+    equipment:             [],
+    totalClicks:           0,
+    log:                   [makeLog('SYSTEM INITIALIZED. AWAITING COMMANDS.', 'system')],
+    toasts:                [],
+    offlineReport:         undefined,
+    activeEvent:           undefined,
+    cpsEventMult:          1,
+    achievements:          [],
+    pendingAchievements:   [],
+    lastTick:              Date.now(),
+    sessionStart:          Date.now(),
+    totalPlaytimeMs:       0,
+    tickCount:             0,
+    memoryMax:             1000,
+    activeRunModifiers:    [],
+    pendingModifierChoice: undefined,
   }
 }
 
@@ -82,8 +97,11 @@ function loadState(): GameState {
     if (!raw) return makeInitialState()
 
     const saved = JSON.parse(raw) as GameState
+    const skills        = saved.neuralSkillsPurchased ?? []
+    const offlineEff    = getOfflineEfficiency(skills)
+    const equipCap      = getEquipmentCap(skills)
     const offlineS      = Math.min((Date.now() - saved.lastTick) / 1000, MAX_OFFLINE_S)
-    const offlineCycles = saved.cyclesPerSecond * offlineS * 0.5
+    const offlineCycles = saved.cyclesPerSecond * offlineS * offlineEff
 
     const mergedProcesses: Process[] = INITIAL_PROCESSES.map(init => {
       const sp = saved.processes?.find(p => p.id === init.id)
@@ -108,7 +126,7 @@ function loadState(): GameState {
       ))
     })
 
-    const mergedEquip = [...(saved.equipment ?? []), ...offlineDrops].slice(-MAX_EQUIP)
+    const mergedEquip = [...(saved.equipment ?? []), ...offlineDrops].slice(-equipCap)
 
     return {
       ...saved,
@@ -124,13 +142,18 @@ function loadState(): GameState {
         dropsGained:  offlineDrops,
       } : undefined,
       // New fields with backward compat
-      activeEvent:         undefined,
-      cpsEventMult:        1,
-      achievements:        saved.achievements        ?? [],
-      pendingAchievements: [],
-      tickCount:           0,
-      lastTick:            Date.now(),
-      sessionStart:        Date.now(),
+      activeEvent:           undefined,
+      cpsEventMult:          1,
+      achievements:          saved.achievements          ?? [],
+      pendingAchievements:   [],
+      neuralFragments:       saved.neuralFragments       ?? 0,
+      neuralSkillsPurchased: saved.neuralSkillsPurchased ?? [],
+      tickCount:             0,
+      lastTick:              Date.now(),
+      sessionStart:          Date.now(),
+      memoryMax:             saved.memoryMax             ?? 1000,
+      activeRunModifiers:    saved.activeRunModifiers    ?? [],
+      pendingModifierChoice: undefined,
     }
   } catch {
     return makeInitialState()
@@ -158,11 +181,12 @@ function tick(prev: GameState): GameState {
     toasts = [...toasts, makeToast(msg, 'system')]
   }
 
+  const equipCap         = getEquipmentCap(prev.neuralSkillsPurchased ?? [])
   let equipment          = prev.equipment
   let totalDropsByRarity = { ...(prev.totalDropsByRarity ?? {}) }
   if (Math.random() < getDropRate(prev) * dt) {
     const item    = rollEquipment()
-    equipment     = [...equipment, item].slice(-MAX_EQUIP)
+    equipment     = [...equipment, item].slice(-equipCap)
     totalDropsByRarity[item.rarity] = (totalDropsByRarity[item.rarity] ?? 0) + 1
     const logType: LogType = (item.rarity === 'mythic' || item.rarity === 'legendary') ? 'warning' : 'success'
     const msg     = `[DROP] ${item.name} — ${item.rarity.toUpperCase()} (+${(item.mult * 100).toFixed(1)}%)`
@@ -170,8 +194,14 @@ function tick(prev: GameState): GameState {
     toasts = [...toasts, makeToast(msg, logType)]
   }
 
-  const newEntropy = Math.min(100, prev.entropy + 0.001 * prev.nodes * dt)
-  let newCycles    = prev.cycles + gained
+  // Entropy grows faster at higher breach levels (each breach +20%)
+  const breachLevel      = prev.prestigeCount ?? 0
+  const skills           = prev.neuralSkillsPurchased ?? []
+  const modEntropyMult   = getActiveModifier(prev.activeRunModifiers ?? [])?.effects.entropyMult ?? 1
+  const cryptoReduction  = getCryptoEntropyReduction(prev.equipment)
+  const entropyMult      = getEntropyGrowthMult(skills) * (1 + breachLevel * 0.2) * (1 - cryptoReduction) * modEntropyMult
+  const newEntropy    = Math.min(100, prev.entropy + 0.001 * prev.nodes * entropyMult * dt)
+  let newCycles       = prev.cycles + gained
 
   if (newEntropy > 80 && Math.random() < 0.0005 * dt) {
     const penalty  = newCycles * 0.05
@@ -192,8 +222,10 @@ function tick(prev: GameState): GameState {
   }
 
   // Spawn (only when no active event)
+  // Event frequency scales up with breach level (each breach +10%, max +60%)
   if (!activeEvent) {
-    const rate = EVENT_RATE[prev.stage] / 60  // events per second
+    const breachEventBonus = 1 + Math.min((prev.prestigeCount ?? 0) * 0.1, 0.6)
+    const rate = (EVENT_RATE[prev.stage] / 60) * breachEventBonus
     if (Math.random() < rate * dt) {
       const def = pickEvent(prev)
       if (def) {
@@ -207,7 +239,7 @@ function tick(prev: GameState): GameState {
           }
           if (def.autoEffect.dropEquip) {
             const item = rollEquipment()
-            equipment  = [...equipment, item].slice(-MAX_EQUIP)
+            equipment  = [...equipment, item].slice(-equipCap)
             const lt: LogType = (item.rarity === 'legendary' || item.rarity === 'mythic') ? 'warning' : 'success'
             const msg = `[EVENT DROP] ${item.name} — ${item.rarity.toUpperCase()} (+${(item.mult * 100).toFixed(1)}%)`
             logs   = pushLog(logs, makeLog(msg, lt))
@@ -325,15 +357,25 @@ export function useGameState() {
       const cost = getProcessCost(p)
       if (prev.cycles < cost) return prev
 
+      // Memory check
+      const memUsed = getMemoryUsed(prev.processes)
+      const memMax  = getTotalMemoryMax(prev)
+      if (memUsed >= memMax) return prev
+
       const updated = [...prev.processes]
       updated[idx]  = { ...p, count: p.count + 1 }
+
+      const isGhostBotnet = getActiveModifier(prev.activeRunModifiers ?? [])?.effects.ghostBotnet
+      const entropyAdd = processId === 'botnet_node'
+        ? (isGhostBotnet ? 0 : 2)
+        : 0.5
 
       return {
         ...prev,
         cycles:    prev.cycles - cost,
         processes: updated,
         nodes:     prev.nodes + (processId === 'botnet_node' ? 1 : 0),
-        entropy:   Math.min(100, prev.entropy + (processId === 'botnet_node' ? 2 : 0.5)),
+        entropy:   Math.min(100, prev.entropy + entropyAdd),
         log:       pushLog(prev.log, makeLog(`PROCESS STARTED: ${p.name} (×${p.count + 1})`, 'success')),
       }
     })
@@ -344,11 +386,13 @@ export function useGameState() {
       const upgrade = UPGRADES.find(u => u.id === upgradeId)
       if (!upgrade || prev.upgrades.includes(upgradeId)) return prev
       if (!isUpgradeUnlocked(upgrade, prev)) return prev
-      if (prev.cycles < upgrade.cost) return prev
+      const modUpgradeMult = getActiveModifier(prev.activeRunModifiers ?? [])?.effects.upgradeCostMult ?? 1
+      const effectiveCost  = Math.floor(upgrade.cost * modUpgradeMult)
+      if (prev.cycles < effectiveCost) return prev
 
       return {
         ...prev,
-        cycles:   prev.cycles - upgrade.cost,
+        cycles:   prev.cycles - effectiveCost,
         upgrades: [...prev.upgrades, upgradeId],
         log:      pushLog(prev.log, makeLog(`UPGRADE INSTALLED: ${upgrade.name}`, 'system')),
         toasts:   [...prev.toasts, makeToast(`UPGRADE: ${upgrade.name}`, 'system')],
@@ -415,8 +459,9 @@ export function useGameState() {
 
       // Equipment drop
       if (effect.dropEquip) {
-        const item = rollEquipment()
-        equipment  = [...equipment, item].slice(-MAX_EQUIP)
+        const item     = rollEquipment()
+        const cap      = getEquipmentCap(prev.neuralSkillsPurchased ?? [])
+        equipment      = [...equipment, item].slice(-cap)
         const lt: LogType = (item.rarity === 'legendary' || item.rarity === 'mythic') ? 'warning' : 'success'
         logs   = pushLog(logs, makeLog(`[EVENT DROP] ${item.name} — ${item.rarity.toUpperCase()} (+${(item.mult * 100).toFixed(1)}%)`, lt))
         toasts = [...toasts, makeToast(`[DROP] ${item.name} (${item.rarity.toUpperCase()})`, lt)]
@@ -460,32 +505,122 @@ export function useGameState() {
     })
   }, [])
 
-  // ── Prestige ─────────────────────────────────────────────────────────
+  // ── Prestige (Neural Reboot) ──────────────────────────────────────────
   const prestige = useCallback(() => {
     setState(prev => {
       if (prev.stage !== 'singularity') return prev
 
       const newPrestigeCount  = prev.prestigeCount + 1
       const newMultiplier     = parseFloat((prev.prestigeMultiplier * 1.5).toFixed(4))
-      const msg = `PRESTIGE ×${newPrestigeCount} // Multiplier: ×${newMultiplier.toFixed(2)}`
+
+      // Neural Fragments earned: scales with total cycles + breach depth
+      const fragmentsBase   = Math.floor(prev.totalCyclesEarned / 1_000_000)
+      const fragMult        = getFragmentMult(prev.neuralSkillsPurchased ?? [])
+      const fragmentsGained = Math.max(1, Math.floor(
+        fragmentsBase * Math.log10(newPrestigeCount + 1) * fragMult
+      ))
+      const totalFragments  = (prev.neuralFragments ?? 0) + fragmentsGained
+
+      const msg      = `NEURAL_REBOOT ×${newPrestigeCount} // ×${newMultiplier.toFixed(2)} CPS // +${fragmentsGained} fragments`
+      const nextHint = newPrestigeCount < 3
+        ? 'BREACH_3 UNLOCKS: GOVERNMENT_TRACE events'
+        : newPrestigeCount < 5
+          ? 'BREACH_5 UNLOCKS: NEURAL_VIRUS events'
+          : newPrestigeCount < 10
+            ? 'BREACH_10 UNLOCKS: SINGULARITY_LOCK events'
+            : 'THREAT MATRIX: FULLY ACTIVE'
 
       const fresh = makeInitialState()
       return {
         ...fresh,
-        prestigeCount:       newPrestigeCount,
-        prestigeMultiplier:  newMultiplier,
-        equipment:           prev.equipment,   // keep all equipment
-        achievements:        prev.achievements ?? [],
-        pendingAchievements: [],
+        prestigeCount:         newPrestigeCount,
+        prestigeMultiplier:    newMultiplier,
+        neuralFragments:       totalFragments,
+        neuralSkillsPurchased: prev.neuralSkillsPurchased ?? [],  // skills persist
+        equipment:             prev.equipment,                     // equipment persists
+        achievements:          prev.achievements ?? [],
+        pendingAchievements:   [],
+        activeRunModifiers:    [],
+        pendingModifierChoice: pickModifiers(),
         log: [
           makeLog('━'.repeat(40), 'system'),
           makeLog(msg, 'system'),
+          makeLog(`NEURAL FRAGMENTS: +${fragmentsGained} (total: ${totalFragments})`, 'warning'),
+          makeLog(nextHint, 'warning'),
           makeLog('SYSTEM RESET. KNOWLEDGE RETAINED.', 'system'),
           makeLog('━'.repeat(40), 'system'),
         ],
-        toasts:      [makeToast(msg, 'system')],
+        toasts:       [makeToast(`⟳ NEURAL REBOOT ×${newPrestigeCount} — +${fragmentsGained} fragments`, 'system')],
         sessionStart: Date.now(),
         lastTick:     Date.now(),
+      }
+    })
+  }, [])
+
+  // ── Skill tree ────────────────────────────────────────────────────────
+  const buySkill = useCallback((skillId: string) => {
+    setState(prev => {
+      const skill = SKILL_TREE.find(s => s.id === skillId)
+      if (!skill) return prev
+
+      const purchased = prev.neuralSkillsPurchased ?? []
+      if (purchased.includes(skillId)) return prev
+      if (skill.requires && !purchased.includes(skill.requires)) return prev
+      if ((prev.neuralFragments ?? 0) < skill.cost) return prev
+
+      return {
+        ...prev,
+        neuralFragments:       (prev.neuralFragments ?? 0) - skill.cost,
+        neuralSkillsPurchased: [...purchased, skillId],
+        log:    pushLog(prev.log, makeLog(`SKILL INSTALLED: ${skill.name}`, 'system')),
+        toasts: [...prev.toasts, makeToast(`SKILL: ${skill.name}`, 'system')],
+      }
+    })
+  }, [])
+
+  // ── Run modifier actions ──────────────────────────────────────────────
+
+  const selectModifier = useCallback((modifierId: string) => {
+    setState(prev => {
+      if (!prev.pendingModifierChoice?.includes(modifierId)) return prev
+      const mod = MODIFIERS.find(m => m.id === modifierId)
+      const startEntropy = mod?.effects.startEntropy ?? 0
+      return {
+        ...prev,
+        activeRunModifiers:    [modifierId],
+        pendingModifierChoice: undefined,
+        entropy:               Math.min(100, startEntropy),
+        log: pushLog(prev.log, makeLog(`RUN MODIFIER ACTIVE: ${mod?.name ?? modifierId}`, 'warning')),
+        toasts: [...prev.toasts, makeToast(`◈ MOD: ${mod?.name ?? modifierId}`, 'warning')],
+      }
+    })
+  }, [])
+
+  const skipModifier = useCallback(() => {
+    setState(prev => ({
+      ...prev,
+      pendingModifierChoice: undefined,
+      log: pushLog(prev.log, makeLog('RUN MODIFIER: SKIPPED', 'info')),
+    }))
+  }, [])
+
+  // ── Disenchant equipment ──────────────────────────────────────────────
+
+  const DISENCHANT_FRAGS: Record<string, number> = {
+    common: 1, uncommon: 3, rare: 8, epic: 20, legendary: 50, mythic: 120,
+  }
+
+  const disenchantEquip = useCallback((equipId: string) => {
+    setState(prev => {
+      const item = prev.equipment.find(e => e.id === equipId)
+      if (!item) return prev
+      const frags = DISENCHANT_FRAGS[item.rarity] ?? 1
+      return {
+        ...prev,
+        equipment:       prev.equipment.filter(e => e.id !== equipId),
+        neuralFragments: (prev.neuralFragments ?? 0) + frags,
+        log:    pushLog(prev.log, makeLog(`DISENCHANT: ${item.name} → +${frags} fragments`, 'info')),
+        toasts: [...prev.toasts, makeToast(`DISENCHANT +${frags}ƒ`, 'info')],
       }
     })
   }, [])
@@ -605,7 +740,8 @@ export function useGameState() {
     state,
     click, buyProcess, buyUpgrade, purgeEntropy,
     resolveEvent, dismissEvent,
-    prestige,
+    prestige, buySkill,
+    selectModifier, skipModifier, disenchantEquip,
     saveToSlot, loadFromSlot, getSaveSlots,
     exportSave, importSave,
     dismissToast, dismissOfflineReport, resetGame,

@@ -35,6 +35,7 @@ export interface EventDef {
   choices?:    EventChoice[]   // if present, player must pick one
   autoEffect?: EventEffect     // applied immediately on spawn (no choice needed)
   minStage?:   Stage
+  minBreach?:  number          // minimum prestigeCount to spawn
   weight:      number          // relative spawn probability
 }
 
@@ -204,6 +205,87 @@ export const EVENT_POOL: EventDef[] = [
     weight:    20,
     minStage:  'emergence',
   },
+  // ── BREACH-LEVEL THREATS (unlock at higher prestige counts) ───────────
+  {
+    id:          'government_trace',
+    title:       'GOVERNMENT_TRACE',
+    type:        'negative',
+    description: 'National cyber-authority traced your origin. Asset seizure in progress.',
+    duration:    0,
+    autoEffect:  { cyclesDelta: -0.2 },  // instant -20% of current cycles
+    weight:      18,
+    minStage:    'emergence',
+    minBreach:   3,
+  },
+  {
+    id:          'neural_virus',
+    title:       'NEURAL_VIRUS',
+    type:        'negative',
+    description: 'Hostile AI injected. All neural processes critically degraded for 45s.',
+    duration:    45,
+    autoEffect:  { cpsMult: 0.15 },  // -85% CPS for 45s
+    weight:      14,
+    minStage:    'dominance',
+    minBreach:   5,
+  },
+  {
+    id:          'singularity_lock',
+    title:       'SINGULARITY_LOCK',
+    type:        'choice',
+    description: 'Counter-AI deployed a Singularity Lock. Your systems are being isolated.',
+    duration:    0,
+    choices: [
+      {
+        id:          'kernel_panic',
+        label:       'KERNEL_PANIC',
+        description: 'Force shutdown. Lose 30% cycles but purge the lock. −15 entropy.',
+        effect:      { cyclesDelta: -0.3, entropyDelta: -15 },
+      },
+      {
+        id:          'ride_it_out',
+        label:       'RIDE_IT_OUT',
+        description: 'Stay online. Absorb full lock pressure. +60 entropy, no cycle loss.',
+        effect:      { entropyDelta: 60 },
+      },
+    ],
+    weight:    10,
+    minStage:  'singularity',
+    minBreach: 10,
+  },
+  {
+    id:          'fork_bomb',
+    title:       'FORK_BOMB',
+    type:        'positive',
+    description: 'Exponential process replication. All output ×2 for 30s.',
+    duration:    30,
+    autoEffect:  { cpsMult: 2 },
+    weight:      10,
+    minStage:    'emergence',
+  },
+  {
+    id:          'memory_overflow',
+    title:       'MEMORY_OVERFLOW',
+    type:        'choice',
+    description: 'Buffer overflow detected. Memory boundaries exceeded.',
+    duration:    0,
+    choices: [
+      {
+        id:          'flush',
+        label:       'FLUSH_BUFFERS',
+        description: 'Lose 15% cycles, but reduce entropy −15.',
+        effect:      { cyclesDelta: -0.15, entropyDelta: -15 },
+      },
+      {
+        id:          'exploit_overflow',
+        label:       'EXPLOIT_OVERFLOW',
+        description: 'Use it. +CPS × 40 cycles. +30 entropy.',
+        effect:      { cyclesDelta: 40, entropyDelta: 30 },
+      },
+    ],
+    weight:    12,
+    minStage:  'dominance',
+    minBreach: 2,
+  },
 ]
 
 // ── Spawn probability per stage (events per minute) ───────────────────────
@@ -218,11 +300,13 @@ export const EVENT_RATE: Record<Stage, number> = {
 // ── Pick a random event for the current stage ─────────────────────────────
 export function pickEvent(state: GameState): EventDef | null {
   const stageOrder: Stage[] = ['genesis', 'propagation', 'emergence', 'dominance', 'singularity']
-  const stageIdx = stageOrder.indexOf(state.stage)
+  const stageIdx   = stageOrder.indexOf(state.stage)
+  const breachLevel = state.prestigeCount ?? 0
 
   const eligible = EVENT_POOL.filter(e => {
-    if (!e.minStage) return true
-    return stageOrder.indexOf(e.minStage) <= stageIdx
+    if (e.minStage  && stageOrder.indexOf(e.minStage) > stageIdx) return false
+    if (e.minBreach && breachLevel < e.minBreach) return false
+    return true
   })
 
   const total  = eligible.reduce((s, e) => s + e.weight, 0)

@@ -11,13 +11,19 @@ import {
   getAllMult,
   getClickMult,
   getTotalCps,
+  getDropRate,
   RARITY_COLORS,
   RARITY_BORDER,
   RARITY_BG,
   STAGE_LABELS,
   STAGE_THRESHOLDS,
   UPGRADES,
+  SKILL_TREE,
+  MODIFIERS,
   isUpgradeUnlocked,
+  getTotalMemoryMax,
+  getMemoryUsed,
+  type RunModifier,
   type Process,
   type Equipment,
   type EquipmentType,
@@ -29,8 +35,7 @@ import {
 } from '@/types/game'
 
 // ── Types ──────────────────────────────────────────────────────────────────
-// Extend Tab here to add new panels (e.g. 'market' | 'network')
-type Tab = 'processes' | 'upgrades' | 'equipment' | 'stats'
+type Tab = 'processes' | 'upgrades' | 'equipment' | 'skills' | 'stats'
 
 interface FloatItem {
   id:    string
@@ -91,6 +96,66 @@ function ToastStack({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: st
           {t.message}
         </div>
       ))}
+    </div>
+  )
+}
+
+// ── Modifier modal ─────────────────────────────────────────────────────────
+function ModifierModal({
+  choices,
+  onSelect,
+  onSkip,
+}: {
+  choices: string[]
+  onSelect: (id: string) => void
+  onSkip: () => void
+}) {
+  const mods = choices.map(id => MODIFIERS.find(m => m.id === id)).filter(Boolean) as RunModifier[]
+
+  const TYPE_COLOR: Record<string, string> = {
+    positive: 'border-t-green/50 text-t-green',
+    negative: 'border-red-500/50 text-red-400',
+    mixed:    'border-t-amber/50 text-t-amber',
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
+      <div className="border border-purple-600/50 bg-t-bg p-6 max-w-2xl w-full mx-4 shadow-2xl">
+        <p className="text-xs text-purple-400 tracking-widest mb-1">// NEURAL_REBOOT COMPLETE</p>
+        <p className="text-sm text-t-green-hi mb-4 font-semibold">SELECT RUN MODIFIER</p>
+        <p className="text-xs text-t-dim mb-5">
+          Choose one modifier for this run. Effects are permanent until your next Neural Reboot.
+        </p>
+
+        <div className="grid grid-cols-3 gap-3 mb-4">
+          {mods.map(mod => (
+            <button
+              key={mod.id}
+              onClick={() => onSelect(mod.id)}
+              className={[
+                'border p-4 text-left transition-all duration-150 hover:bg-white/5',
+                TYPE_COLOR[mod.type] ?? 'border-t-border text-t-dim',
+              ].join(' ')}
+            >
+              <p className="text-xs font-semibold tracking-wider mb-1">{mod.name}</p>
+              <span className={`text-xs px-1 py-0.5 border mb-2 inline-block ${TYPE_COLOR[mod.type]}`}>
+                {mod.type.toUpperCase()}
+              </span>
+              <p className="text-xs text-t-dim leading-relaxed mt-1">{mod.description}</p>
+            </button>
+          ))}
+        </div>
+
+        <div className="flex justify-end">
+          <button
+            onClick={onSkip}
+            className="text-xs px-4 py-2 border border-t-border/40 text-t-muted hover:text-t-dim
+                       transition-colors duration-150 tracking-wider"
+          >
+            SKIP — NO MODIFIER
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -364,7 +429,7 @@ function UpgradeRow({ id, cycles, upgrades, onBuy }: {
 }
 
 // ── Equipment card ─────────────────────────────────────────────────────────
-function EquipCard({ item }: { item: Equipment }) {
+function EquipCard({ item, onDisenchant }: { item: Equipment; onDisenchant?: (id: string) => void }) {
   return (
     <div className={[
       'border p-3 transition-all duration-150',
@@ -387,6 +452,17 @@ function EquipCard({ item }: { item: Equipment }) {
           <p className="text-xs text-t-muted capitalize mt-0.5">{item.rarity}</p>
         </div>
       </div>
+      {onDisenchant && (
+        <div className="mt-2 pt-1.5 border-t border-t-border/20 flex justify-end">
+          <button
+            onClick={() => onDisenchant(item.id)}
+            className="text-xs px-2 py-0.5 border border-t-border/30 text-t-muted/60
+                       hover:border-red-500/40 hover:text-red-400 transition-colors duration-150"
+          >
+            DISENCHANT
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -566,6 +642,157 @@ function StatsTab({ state }: { state: import('@/types/game').GameState }) {
   )
 }
 
+// ── Skill tree tab ─────────────────────────────────────────────────────────
+function SkillTreeTab({
+  state,
+  onBuySkill,
+}: {
+  state: import('@/types/game').GameState
+  onBuySkill: (id: string) => void
+}) {
+  const purchased  = state.neuralSkillsPurchased ?? []
+  const fragments  = state.neuralFragments ?? 0
+  const breachLvl  = state.prestigeCount ?? 0
+
+  return (
+    <div className="space-y-4 p-3">
+
+      {/* Header */}
+      <div className="border border-t-border p-3 bg-t-panel/40">
+        <p className="text-xs text-t-muted tracking-widest mb-2">// NEURAL FRAGMENT MATRIX</p>
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-xs text-t-dim">FRAGMENTS AVAILABLE</p>
+            <p className="text-lg font-bold text-purple-400 tabular-nums">{fragments.toLocaleString()}</p>
+          </div>
+          <div className="text-right">
+            <p className="text-xs text-t-dim">BREACH LEVEL</p>
+            <p className={`text-lg font-bold tabular-nums ${
+              breachLvl >= 10 ? 'text-red-400' :
+              breachLvl >= 5  ? 'text-t-amber' :
+              breachLvl >= 1  ? 'text-purple-400' : 'text-t-muted'
+            }`}>{breachLvl > 0 ? `BREACH_${breachLvl}` : 'VIRGIN'}</p>
+          </div>
+        </div>
+        {breachLvl === 0 && (
+          <p className="text-xs text-t-muted mt-2 italic">
+            Reach SINGULARITY and perform a NEURAL_REBOOT to earn fragments.
+          </p>
+        )}
+      </div>
+
+      {/* Threat level indicator */}
+      {breachLvl > 0 && (
+        <div className="border border-t-border/50 p-2 bg-t-panel/20">
+          <p className="text-xs text-t-muted mb-1.5 tracking-widest">// ACTIVE THREATS</p>
+          <div className="space-y-1">
+            {[
+              { label: 'GOVERNMENT_TRACE', breach: 3, color: 'text-t-amber' },
+              { label: 'NEURAL_VIRUS',     breach: 5, color: 'text-orange-400' },
+              { label: 'SINGULARITY_LOCK', breach: 10, color: 'text-red-400' },
+            ].map(t => {
+              const active = breachLvl >= t.breach
+              return (
+                <div key={t.label} className="flex items-center gap-2">
+                  <span className={`text-xs ${active ? t.color : 'text-t-muted/40'}`}>
+                    {active ? '◆' : '◇'}
+                  </span>
+                  <span className={`text-xs ${active ? t.color : 'text-t-muted/40'}`}>
+                    {t.label}
+                  </span>
+                  {!active && (
+                    <span className="text-xs text-t-muted/40 ml-auto">BREACH_{t.breach}</span>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+          <div className="mt-2 flex items-center gap-1.5">
+            <span className="text-xs text-t-dim">ENTROPY RATE</span>
+            <span className="text-xs text-t-amber tabular-nums ml-auto">
+              ×{(1 + breachLvl * 0.2).toFixed(1)} base
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-t-dim">EVENT FREQUENCY</span>
+            <span className="text-xs text-t-amber tabular-nums ml-auto">
+              +{Math.min(breachLvl * 10, 60)}%
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Skill nodes */}
+      <div>
+        <p className="text-xs text-t-muted tracking-widest mb-2">// SKILL NODES</p>
+        <div className="space-y-2">
+          {SKILL_TREE.map(skill => {
+            const owned    = purchased.includes(skill.id)
+            const reqMet   = !skill.requires || purchased.includes(skill.requires)
+            const canAfford = fragments >= skill.cost
+            const locked   = !reqMet
+
+            return (
+              <div
+                key={skill.id}
+                className={[
+                  'border p-3 transition-all duration-150',
+                  owned
+                    ? 'border-purple-700/60 bg-purple-950/20'
+                    : locked
+                      ? 'border-t-border/20 opacity-40'
+                      : canAfford
+                        ? 'border-purple-600/40 hover:border-purple-500/70 hover:bg-purple-950/10'
+                        : 'border-t-border/40',
+                ].join(' ')}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className={`text-xs font-semibold tracking-wider ${
+                        owned ? 'text-purple-300' : 'text-purple-400'
+                      }`}>
+                        {owned ? '✓ ' : ''}{skill.name}
+                      </span>
+                      {locked && skill.requires && (
+                        <span className="text-xs text-t-muted/60">
+                          [REQ: {SKILL_TREE.find(s => s.id === skill.requires)?.name ?? skill.requires}]
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-t-dim mt-0.5">{skill.description}</p>
+                  </div>
+
+                  {!owned && !locked && (
+                    <button
+                      onClick={() => onBuySkill(skill.id)}
+                      disabled={!canAfford}
+                      className={[
+                        'shrink-0 text-xs px-2.5 py-1.5 border tracking-wider transition-all duration-150 whitespace-nowrap',
+                        canAfford
+                          ? 'border-purple-500 text-purple-400 hover:bg-purple-900/40'
+                          : 'border-t-border/40 text-t-muted cursor-not-allowed',
+                      ].join(' ')}
+                    >
+                      {skill.cost.toLocaleString()} ƒ
+                    </button>
+                  )}
+                  {owned && (
+                    <span className="shrink-0 text-xs text-purple-400/60 border border-purple-700/40 px-2 py-1">
+                      INSTALLED
+                    </span>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+    </div>
+  )
+}
+
 // ── Stage progress ─────────────────────────────────────────────────────────
 function stageProgress(stage: Stage, total: number): number {
   const order: Stage[] = ['genesis', 'propagation', 'emergence', 'dominance', 'singularity']
@@ -599,8 +826,9 @@ const EQUIP_RARITY_FILTERS: Array<{ value: Rarity | 'all'; label: string }> = [
 // ── Game page ──────────────────────────────────────────────────────────────
 export default function Game() {
   const {
-    state, click, buyProcess, buyUpgrade, purgeEntropy, prestige,
+    state, click, buyProcess, buyUpgrade, purgeEntropy, prestige, buySkill,
     resolveEvent, dismissEvent, dismissToast,
+    selectModifier, skipModifier, disenchantEquip,
   } = useGame()
   const [tab,         setTab]         = useState<Tab>('processes')
   const [equipType,   setEquipType]   = useState<EquipmentType | 'all'>('all')
@@ -661,11 +889,25 @@ export default function Game() {
     return true
   })
 
+  const memUsed = getMemoryUsed(state.processes)
+  const memMax  = getTotalMemoryMax(state)
+  const memPct  = memMax > 0 ? (memUsed / memMax) * 100 : 0
+  const memFull = memUsed >= memMax
+
   return (
     <div className="h-full flex flex-col animate-fade-in">
 
       {/* ── Toast stack ────────────────────────────────────────────── */}
       <ToastStack toasts={state.toasts} onDismiss={dismissToast} />
+
+      {/* ── Modifier selection modal ────────────────────────────────── */}
+      {state.pendingModifierChoice && state.pendingModifierChoice.length > 0 && (
+        <ModifierModal
+          choices={state.pendingModifierChoice}
+          onSelect={selectModifier}
+          onSkip={skipModifier}
+        />
+      )}
 
       {/* ── Status bar ─────────────────────────────────────────────── */}
       <div className="shrink-0 flex items-center gap-0 px-4 py-0
@@ -681,6 +923,24 @@ export default function Game() {
         <span className="mr-4">
           NODES: <span className="text-t-text tabular-nums">{state.nodes}</span>
         </span>
+        {(state.prestigeCount ?? 0) > 0 && (
+          <>
+            <span className="text-t-muted mr-4">//</span>
+            <span className="mr-4">
+              BREACH: <span className="text-purple-400 tabular-nums font-semibold">
+                {state.prestigeCount}
+              </span>
+            </span>
+          </>
+        )}
+        {(state.neuralFragments ?? 0) > 0 && (
+          <>
+            <span className="text-t-muted mr-4">//</span>
+            <span className="mr-4">
+              ƒ: <span className="text-purple-300 tabular-nums">{(state.neuralFragments ?? 0).toLocaleString()}</span>
+            </span>
+          </>
+        )}
         {allMult > 1 && (
           <>
             <span className="text-t-muted mr-4">//</span>
@@ -688,7 +948,7 @@ export default function Game() {
           </>
         )}
 
-        {/* Prestige button — only at Singularity */}
+        {/* Neural Reboot button — only at Singularity */}
         {state.stage === 'singularity' && (
           <button
             onClick={prestige}
@@ -696,7 +956,7 @@ export default function Game() {
                        hover:bg-purple-900/30 transition-all duration-150 tracking-widest
                        animate-glow-pulse"
           >
-            ⟳ PRESTIGE (×{(state.prestigeMultiplier * 1.5).toFixed(2)})
+            ⟳ NEURAL_REBOOT (×{(state.prestigeMultiplier * 1.5).toFixed(2)})
           </button>
         )}
 
@@ -736,6 +996,20 @@ export default function Game() {
             {clickMult > 1 && (
               <StatRow label="CLICK×" value={`×${clickMult.toFixed(0)}`}                     />
             )}
+            <div className="space-y-1 pt-1">
+              <div className="flex justify-between items-center">
+                <span className="text-xs text-t-dim">MEMORY</span>
+                <span className={`text-xs tabular-nums ${memFull ? 'text-red-400' : 'text-t-dim'}`}>
+                  {memUsed}/{memMax}
+                </span>
+              </div>
+              <div className="h-1 bg-t-muted overflow-hidden">
+                <div
+                  className={`h-full transition-all duration-500 ${memFull ? 'bg-red-500' : memPct > 80 ? 'bg-t-amber' : 'bg-cyan-500/60'}`}
+                  style={{ width: `${Math.min(100, memPct)}%` }}
+                />
+              </div>
+            </div>
             <StageBreadcrumb current={state.stage} />
           </div>
 
@@ -751,6 +1025,24 @@ export default function Game() {
           <div className="p-3 border-b border-t-border shrink-0">
             <EntropyGauge value={state.entropy} onPurge={purgeEntropy} />
           </div>
+
+          {/* Active run modifier */}
+          {(state.activeRunModifiers ?? []).length > 0 && (() => {
+            const mod = MODIFIERS.find(m => m.id === state.activeRunModifiers[0])
+            if (!mod) return null
+            const typeColor = mod.type === 'positive' ? 'text-t-green border-t-green/30' :
+                              mod.type === 'negative' ? 'text-red-400 border-red-500/30' :
+                              'text-t-amber border-t-amber/30'
+            return (
+              <div className="p-3 border-b border-t-border shrink-0">
+                <p className="text-xs text-t-muted tracking-widest mb-1.5">// RUN MODIFIER</p>
+                <div className={`border p-2 ${typeColor}`}>
+                  <p className="text-xs font-semibold">{mod.name}</p>
+                  <p className="text-xs text-t-dim mt-0.5 leading-relaxed">{mod.description}</p>
+                </div>
+              </div>
+            )
+          })()}
 
           {/* Multiplier breakdown */}
           {(allMult > 1 || state.equipment.length > 0) && (
@@ -783,16 +1075,18 @@ export default function Game() {
         {/* ── CENTER: Tabbed panel ──────────────────────────────────── */}
         <div className="border-r border-t-border flex flex-col overflow-hidden">
 
-          {/* Tab bar — extend Tab type union to add more panels */}
+          {/* Tab bar */}
           <div className="flex shrink-0 border-b border-t-border">
-            {(['processes', 'upgrades', 'equipment', 'stats'] as Tab[]).map(t => (
+            {(['processes', 'upgrades', 'equipment', 'skills', 'stats'] as Tab[]).map(t => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
                 className={[
                   'flex-1 py-2.5 text-xs tracking-widest transition-all duration-150 border-b-2',
                   tab === t
-                    ? 'border-t-green text-t-green bg-t-green-glow'
+                    ? t === 'skills'
+                      ? 'border-purple-500 text-purple-400 bg-purple-950/20'
+                      : 'border-t-green text-t-green bg-t-green-glow'
                     : 'border-transparent text-t-dim hover:text-t-text',
                 ].join(' ')}
               >
@@ -802,6 +1096,11 @@ export default function Game() {
                 )}
                 {t === 'equipment' && state.equipment.length > 0 && (
                   <span className="ml-1 text-t-dim">({state.equipment.length})</span>
+                )}
+                {t === 'skills' && (state.neuralFragments ?? 0) > 0 && (
+                  <span className="ml-1 text-purple-400">
+                    ({(state.neuralFragments ?? 0).toLocaleString()}ƒ)
+                  </span>
                 )}
                 {t === 'stats' && state.achievements.length > 0 && (
                   <span className="ml-1 text-t-green">({state.achievements.length})</span>
@@ -889,7 +1188,7 @@ export default function Game() {
                       <p>No equipment dropped yet.</p>
                       <p className="mt-1 text-t-dim">
                         Equipment drops from node scanning.<br/>
-                        Rate: {(state.nodes * 0.0003 * 100).toFixed(3)}%/s
+                        Rate: {(getDropRate(state) * 100).toFixed(4)}%/s
                       </p>
                     </>
                   ) : (
@@ -897,8 +1196,12 @@ export default function Game() {
                   )}
                 </div>
               ) : (
-                filteredEquip.map(e => <EquipCard key={e.id} item={e} />)
+                filteredEquip.map(e => <EquipCard key={e.id} item={e} onDisenchant={disenchantEquip} />)
               )
+            )}
+
+            {tab === 'skills' && (
+              <SkillTreeTab state={state} onBuySkill={buySkill} />
             )}
 
             {tab === 'stats' && <StatsTab state={state} />}
