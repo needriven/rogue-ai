@@ -10,6 +10,12 @@ services:
     environment:
       - DATABASE_PATH=/data/saves.db
       - TERM_TOKEN=${TERM_TOKEN:-}
+      - REDIS_URL=redis://redis:6379
+      - MONGO_URL=mongodb://rogue:${MONGO_PASSWORD:-rogue_dev_pw}@mongodb:27017/rogueai?authSource=admin
+      - MONGO_DB=rogueai
+    depends_on:
+      - redis
+      - mongodb
     networks:
       - app-net
     healthcheck:
@@ -17,6 +23,29 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  # ── Redis ──────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    networks:
+      - app-net
+
+  # ── MongoDB ────────────────────────────────────────
+  mongodb:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: rogue
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-rogue_dev_pw}
+      MONGO_INITDB_DATABASE: rogueai
+    networks:
+      - app-net
 
   # ── Production web server ──────────────────────────
   web:
@@ -49,6 +78,8 @@ services:
 volumes:
   certbot-webroot:
   api-data:
+  redis-data:
+  mongo-data:
 
 networks:
   app-net:

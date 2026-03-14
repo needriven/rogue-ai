@@ -11,11 +11,14 @@ from typing import Optional
 import aiosqlite
 import feedparser
 import httpx
+import math
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from redis.asyncio import Redis as AIORedis
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATABASE_PATH  = os.environ.get("DATABASE_PATH", "./saves.db")
@@ -32,6 +35,14 @@ ALL_SETTING_KEYS    = [
     "github_repo", "slack_webhook", "discord_webhook",
 ]
 BOT_RUN_TIMEOUT = 300  # seconds
+
+REDIS_URL  = os.environ.get("REDIS_URL",  "redis://localhost:6379")
+MONGO_URL  = os.environ.get("MONGO_URL",  "mongodb://localhost:27017")
+MONGO_DB   = os.environ.get("MONGO_DB",   "rogueai")
+
+# Global clients (initialized in lifespan)
+redis_client: AIORedis | None = None
+mongo_client: AsyncIOMotorClient | None = None
 
 
 def _valid_session(session_id: str) -> bool:
@@ -374,6 +385,17 @@ async def _run_bot_task(run_id: int, bot_id: int, code: str, env_extras: dict) -
 # ── App ───────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global redis_client, mongo_client
+    # Redis
+    redis_client = AIORedis.from_url(REDIS_URL, decode_responses=True)
+    # MongoDB
+    mongo_client = AsyncIOMotorClient(MONGO_URL)
+    db = mongo_client[MONGO_DB]
+    # MongoDB indexes
+    await db.market_listings.create_index("expiresAt", expireAfterSeconds=0)
+    await db.market_listings.create_index([("item.rarity", 1), ("item.type", 1)])
+    await db.players.create_index("lastSeen")
+
     await init_db()
     scheduler.start()
     await _load_bot_schedules()
@@ -385,6 +407,10 @@ async def lifespan(_: FastAPI):
     except asyncio.CancelledError:
         pass
     scheduler.shutdown(wait=False)
+    if redis_client:
+        await redis_client.aclose()
+    if mongo_client:
+        mongo_client.close()
 
 
 app = FastAPI(title="Rogue AI API", version="1.0.0", lifespan=lifespan)
@@ -406,6 +432,31 @@ class FeedSourcePayload(BaseModel):
     url:  str
     name: str  = ""
     tag:  str  = "general"
+
+
+# ── Network models ─────────────────────────────────────────────────────────────
+class ScoreSubmit(BaseModel):
+    session_id:          str
+    display_name:        str = ""
+    total_cycles:        float
+    breach_level:        int
+    prestige_multiplier: float
+    stage:               str = "genesis"
+
+class MarketListRequest(BaseModel):
+    session_id:   str
+    display_name: str = ""
+    item_name:    str
+    item_rarity:  str
+    item_type:    str
+    item_mult:    float
+    item_desc:    str
+    price_frag:   int
+
+class MarketBuyRequest(BaseModel):
+    session_id:       str
+    listing_id:       str
+    buyer_fragments:  int
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -1570,3 +1621,376 @@ async def ai_agent(payload: AgentPayload):
             "output_tokens": response.usage.output_tokens,
         },
     }
+
+
+# ── Network helpers ────────────────────────────────────────────────────────────
+
+def _get_redis() -> AIORedis:
+    if not redis_client:
+        raise HTTPException(503, "Redis not available")
+    return redis_client
+
+def _get_mongo():
+    if not mongo_client:
+        raise HTTPException(503, "MongoDB not available")
+    return mongo_client[MONGO_DB]
+
+def _safe_display_name(session_id: str, name: str) -> str:
+    """Generate safe display name, fallback to session prefix."""
+    if name and len(name.strip()) >= 2:
+        clean = name.strip()[:20]
+        import re as _re
+        clean = _re.sub(r'[^a-zA-Z0-9_\-]', '', clean)
+        if len(clean) >= 2:
+            return clean
+    return f"AGENT_{session_id[:8].upper()}"
+
+async def _check_rate_limit(r: AIORedis, key: str, limit: int, window: int) -> bool:
+    count = await r.incr(key)
+    if count == 1:
+        await r.expire(key, window)
+    return count <= limit
+
+async def _maybe_trigger_global_event(r: AIORedis, db, breach_level: int, total_cycles: float):
+    """Check if player activity should trigger a global server event."""
+    existing = await r.hget("event:global", "expiresAt")
+    if existing and float(existing) > time.time():
+        return  # event already active
+
+    event = None
+    if breach_level >= 10:
+        event = {
+            "type": "singularity_wave",
+            "title": "SINGULARITY_WAVE",
+            "description": f"A Breach-10 AI triggered a cascade. All players: drop rate ×2 for 1h.",
+            "effectType": "drop_rate",
+            "effectValue": "2.0",
+            "expiresAt": str(time.time() + 3600),
+        }
+    elif total_cycles >= 1e15:  # 1 Peta-cycle
+        event = {
+            "type": "mega_miner",
+            "title": "MEGA_MINER_DETECTED",
+            "description": "A player reached Peta-scale computation. All players: CPS ×1.3 for 30m.",
+            "effectType": "cps_mult",
+            "effectValue": "1.3",
+            "expiresAt": str(time.time() + 1800),
+        }
+
+    if event:
+        await r.hset("event:global", mapping=event)
+        await r.expire("event:global", 3700)
+        await db.global_events_log.insert_one({
+            "type": event["type"], "title": event["title"],
+            "startedAt": time.time(),
+            "expiresAt": float(event["expiresAt"]),
+        })
+
+
+# ── Network endpoints ──────────────────────────────────────────────────────────
+
+@app.post("/api/network/score")
+async def submit_score(body: ScoreSubmit):
+    if not _valid_session(body.session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    r  = _get_redis()
+    db = _get_mongo()
+
+    # Rate limit: 1 submit per 30s per session
+    rl_key = f"ratelimit:score:{body.session_id}"
+    if not await _check_rate_limit(r, rl_key, 2, 30):
+        raise HTTPException(429, "Rate limit: submit once per 30s")
+
+    display_name = _safe_display_name(body.session_id, body.display_name)
+
+    # Update Redis leaderboards (sorted sets)
+    await r.zadd("leaderboard:cycles",  {body.session_id: body.total_cycles})
+    await r.zadd("leaderboard:breach",  {body.session_id: float(body.breach_level)})
+
+    # Store display name mapping (hash)
+    await r.hset("players:names", body.session_id, display_name)
+
+    # Upsert player in MongoDB
+    now = time.time()
+    await db.players.update_one(
+        {"_id": body.session_id},
+        {"$set": {
+            "displayName":    display_name,
+            "stage":          body.stage,
+            "lastSeen":       now,
+            "stats.maxCycles":          body.total_cycles,
+            "stats.maxBreachLevel":     body.breach_level,
+            "stats.prestigeMultiplier": body.prestige_multiplier,
+        }, "$setOnInsert": {"firstSeen": now}},
+        upsert=True,
+    )
+
+    # Maybe trigger global event
+    await _maybe_trigger_global_event(r, db, body.breach_level, body.total_cycles)
+
+    return {"ok": True, "displayName": display_name}
+
+
+@app.get("/api/network/leaderboard")
+async def get_leaderboard(
+    type: str = Query("cycles", regex="^(cycles|breach)$"),
+    limit: int = Query(50, ge=1, le=100),
+):
+    r = _get_redis()
+
+    key = f"leaderboard:{type}"
+    # Try cache first
+    cache_key = f"cache:lb:{type}:{limit}"
+    cached = await r.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    # Get top N from sorted set (descending)
+    raw = await r.zrevrange(key, 0, limit - 1, withscores=True)
+    names = await r.hmget("players:names", [sid for sid, _ in raw]) if raw else []
+
+    entries = []
+    for i, ((sid, score), name) in enumerate(zip(raw, names)):
+        entries.append({
+            "rank":        i + 1,
+            "sessionId":   sid[:8] + "...",  # privacy: truncate
+            "displayName": name or f"AGENT_{sid[:8].upper()}",
+            "score":       score,
+        })
+
+    result = {"entries": entries, "type": type}
+
+    # Cache for 30s
+    await r.set(cache_key, json.dumps(result), ex=30)
+    return result
+
+
+@app.get("/api/network/leaderboard/rank/{session_id}")
+async def get_player_rank(session_id: str, type: str = Query("cycles")):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+    r = _get_redis()
+    key = f"leaderboard:{type}"
+    rank  = await r.zrevrank(key, session_id)
+    score = await r.zscore(key, session_id)
+    total = await r.zcard(key)
+    return {
+        "rank":  (rank + 1) if rank is not None else None,
+        "score": score,
+        "total": total,
+    }
+
+
+@app.get("/api/network/market")
+async def get_market(
+    type:   str = Query("all"),
+    rarity: str = Query("all"),
+    limit:  int = Query(30, ge=1, le=100),
+):
+    db = _get_mongo()
+
+    # Build filter
+    filt: dict = {"expiresAt": {"$gt": time.time()}}
+    if type   != "all": filt["item.type"]   = type
+    if rarity != "all": filt["item.rarity"] = rarity
+
+    cursor = db.market_listings.find(filt).sort("createdAt", -1).limit(limit)
+    docs   = await cursor.to_list(length=limit)
+
+    listings = []
+    for d in docs:
+        listings.append({
+            "id":          str(d["_id"]),
+            "sellerName":  d.get("sellerName", "UNKNOWN"),
+            "item":        d.get("item", {}),
+            "priceFrag":   d.get("priceFrag", 0),
+            "expiresAt":   d.get("expiresAt", 0),
+            "createdAt":   d.get("createdAt", 0),
+        })
+
+    total = await db.market_listings.count_documents({"expiresAt": {"$gt": time.time()}})
+    return {"listings": listings, "total": total}
+
+
+@app.post("/api/network/market/list")
+async def list_equipment(body: MarketListRequest):
+    if not _valid_session(body.session_id):
+        raise HTTPException(400, "Invalid session_id")
+    if body.price_frag < 1 or body.price_frag > 10000:
+        raise HTTPException(400, "Price must be 1–10000 fragments")
+    if body.item_mult <= 0 or body.item_mult > 20:
+        raise HTTPException(400, "Invalid item mult")
+
+    r  = _get_redis()
+    db = _get_mongo()
+
+    # Rate limit: 3 listings per 60s
+    rl_key = f"ratelimit:market_list:{body.session_id}"
+    if not await _check_rate_limit(r, rl_key, 3, 60):
+        raise HTTPException(429, "Rate limit: max 3 listings per minute")
+
+    # Max 10 active listings per seller
+    existing_count = await db.market_listings.count_documents({
+        "sellerId": body.session_id,
+        "expiresAt": {"$gt": time.time()},
+    })
+    if existing_count >= 10:
+        raise HTTPException(400, "Max 10 active listings per player")
+
+    display_name = _safe_display_name(body.session_id, body.display_name)
+    now      = time.time()
+    expires  = now + 86400  # 24 hours
+
+    valid_rarities = {"common", "uncommon", "rare", "epic", "legendary", "mythic"}
+    valid_types    = {"cpu", "memory", "nic", "crypto", "algorithm"}
+    if body.item_rarity not in valid_rarities:
+        raise HTTPException(400, "Invalid rarity")
+    if body.item_type not in valid_types:
+        raise HTTPException(400, "Invalid type")
+
+    result = await db.market_listings.insert_one({
+        "sellerId":    body.session_id,
+        "sellerName":  display_name,
+        "item": {
+            "name":        body.item_name[:50],
+            "rarity":      body.item_rarity,
+            "type":        body.item_type,
+            "mult":        round(body.item_mult, 3),
+            "description": body.item_desc[:100],
+        },
+        "priceFrag":  body.price_frag,
+        "createdAt":  now,
+        "expiresAt":  expires,
+    })
+
+    listing_id = str(result.inserted_id)
+    # Add to Redis sorted set (score = expiresAt for TTL tracking)
+    await r.zadd("market:active", {listing_id: expires})
+    # Invalidate market cache
+    await r.delete("cache:market:all")
+
+    return {"ok": True, "listingId": listing_id, "expiresAt": expires}
+
+
+@app.post("/api/network/market/buy")
+async def buy_equipment(body: MarketBuyRequest):
+    if not _valid_session(body.session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    r  = _get_redis()
+    db = _get_mongo()
+
+    # Rate limit: 10 buys per minute
+    rl_key = f"ratelimit:market_buy:{body.session_id}"
+    if not await _check_rate_limit(r, rl_key, 10, 60):
+        raise HTTPException(429, "Rate limit exceeded")
+
+    from bson import ObjectId
+    try:
+        oid = ObjectId(body.listing_id)
+    except Exception:
+        raise HTTPException(400, "Invalid listing_id")
+
+    listing = await db.market_listings.find_one({
+        "_id":       oid,
+        "expiresAt": {"$gt": time.time()},
+    })
+    if not listing:
+        raise HTTPException(404, "Listing not found or expired")
+    if listing["sellerId"] == body.session_id:
+        raise HTTPException(400, "Cannot buy your own listing")
+    if body.buyer_fragments < listing["priceFrag"]:
+        raise HTTPException(400, f"Not enough fragments (need {listing['priceFrag']})")
+
+    # Delete listing (atomic: if already deleted → 404)
+    del_result = await db.market_listings.delete_one({"_id": oid, "expiresAt": {"$gt": time.time()}})
+    if del_result.deleted_count == 0:
+        raise HTTPException(409, "Listing already sold or expired")
+
+    # Remove from Redis sorted set
+    await r.zrem("market:active", body.listing_id)
+    await r.delete("cache:market:all")
+
+    return {
+        "ok":       True,
+        "item":     listing["item"],
+        "pricePaid": listing["priceFrag"],
+    }
+
+
+@app.delete("/api/network/market/{listing_id}")
+async def cancel_listing(listing_id: str, session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    r  = _get_redis()
+    db = _get_mongo()
+
+    from bson import ObjectId
+    try:
+        oid = ObjectId(listing_id)
+    except Exception:
+        raise HTTPException(400, "Invalid listing_id")
+
+    result = await db.market_listings.delete_one({"_id": oid, "sellerId": session_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Listing not found or not yours")
+
+    await r.zrem("market:active", listing_id)
+    await r.delete("cache:market:all")
+    return {"ok": True}
+
+
+@app.get("/api/network/event")
+async def get_global_event():
+    r = _get_redis()
+    data = await r.hgetall("event:global")
+    if not data or float(data.get("expiresAt", 0)) <= time.time():
+        return {"active": False}
+    return {
+        "active":      True,
+        "type":        data.get("type"),
+        "title":       data.get("title"),
+        "description": data.get("description"),
+        "effectType":  data.get("effectType"),
+        "effectValue": float(data.get("effectValue", 1)),
+        "expiresAt":   float(data.get("expiresAt", 0)),
+        "remainingSec": max(0, float(data.get("expiresAt", 0)) - time.time()),
+    }
+
+
+@app.get("/api/network/stats")
+async def get_network_stats():
+    r  = _get_redis()
+    db = _get_mongo()
+
+    total_players  = await r.zcard("leaderboard:cycles")
+    active_market  = await db.market_listings.count_documents({"expiresAt": {"$gt": time.time()}})
+    top_breach_raw = await r.zrevrange("leaderboard:breach", 0, 0, withscores=True)
+    top_breach     = int(top_breach_raw[0][1]) if top_breach_raw else 0
+    top_cycles_raw = await r.zrevrange("leaderboard:cycles", 0, 0, withscores=True)
+    top_cycles     = top_cycles_raw[0][1] if top_cycles_raw else 0
+
+    event_data = await r.hgetall("event:global")
+    has_event  = bool(event_data) and float(event_data.get("expiresAt", 0)) > time.time()
+
+    return {
+        "totalPlayers":   total_players,
+        "activeListings": active_market,
+        "topBreachLevel": top_breach,
+        "topCycles":      top_cycles,
+        "globalEvent":    has_event,
+    }
+
+
+@app.get("/api/network/profile/{session_id}")
+async def get_profile(session_id: str):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+    db = _get_mongo()
+    player = await db.players.find_one({"_id": session_id})
+    if not player:
+        return {"exists": False}
+    player["_id"] = str(player["_id"])
+    return {"exists": True, "player": player}
