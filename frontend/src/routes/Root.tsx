@@ -5,13 +5,15 @@ import { GameContext } from '@/context/GameContext'
 import OfflineModal from '@/components/OfflineModal'
 
 const NAV_ITEMS = [
-  { to: '/',         label: 'HOME',     icon: '~',  exact: true  },
-  { to: '/game',     label: 'GAME',     icon: '▶',  exact: false },
-  { to: '/feed',     label: 'FEED',     icon: '◈',  exact: false },
-  { to: '/network',  label: 'NETWORK',  icon: '⬡',  exact: false },
-  { to: '/term',     label: 'TERM',     icon: '$',  exact: false },
-  { to: '/ops',      label: 'OPS',      icon: '⌬',  exact: false },
-  { to: '/settings', label: 'SETTINGS', icon: '⚙',  exact: false },
+  { to: '/',          label: 'HOME',      icon: '~',  exact: true  },
+  { to: '/game',      label: 'GAME',      icon: '▶',  exact: false },
+  { to: '/feed',      label: 'FEED',      icon: '◈',  exact: false },
+  { to: '/network',   label: 'NETWORK',   icon: '⬡',  exact: false },
+  { to: '/monitor',   label: 'MONITOR',   icon: '◎',  exact: false },
+  { to: '/analytics', label: 'ANALYTICS', icon: '▲',  exact: false },
+  { to: '/term',      label: 'TERM',      icon: '$',  exact: false },
+  { to: '/ops',       label: 'OPS',       icon: '⌬',  exact: false },
+  { to: '/settings',  label: 'SETTINGS',  icon: '⚙',  exact: false },
 ] as const
 
 function formatUptime(s: number): string {

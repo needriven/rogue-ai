@@ -530,6 +530,30 @@ export function useGameState() {
             ? 'BREACH_10 UNLOCKS: SINGULARITY_LOCK events'
             : 'THREAT MATRIX: FULLY ACTIVE'
 
+      // Fire-and-forget analytics submission
+      const sessionId = localStorage.getItem('rogue-ai-session')
+      if (sessionId) {
+        const runDuration = Math.floor((Date.now() - prev.sessionStart) / 1000)
+        const activeModId = (prev.activeRunModifiers ?? [])[0] ?? ''
+        const byRarity    = prev.totalDropsByRarity as Record<string, number> | undefined
+        fetch('/api/analytics/run', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_id:       sessionId,
+            breach_level:     newPrestigeCount,
+            duration_sec:     runDuration,
+            total_cycles:     prev.totalCyclesEarned,
+            stage_reached:    prev.stage,
+            modifier_used:    activeModId,
+            fragments_gained: fragmentsGained,
+            equip_drops:      Object.values(byRarity ?? {}).reduce((a, b) => a + b, 0),
+            legendary_drops:  byRarity?.legendary ?? 0,
+            mythic_drops:     byRarity?.mythic    ?? 0,
+          }),
+        }).catch(() => {/* ignore network errors */})
+      }
+
       const fresh = makeInitialState()
       return {
         ...fresh,
@@ -542,6 +566,7 @@ export function useGameState() {
         pendingAchievements:   [],
         activeRunModifiers:    [],
         pendingModifierChoice: pickModifiers(),
+        totalDropsByRarity:    {},
         log: [
           makeLog('━'.repeat(40), 'system'),
           makeLog(msg, 'system'),

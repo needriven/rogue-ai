@@ -395,6 +395,7 @@ async def lifespan(_: FastAPI):
     await db.market_listings.create_index("expiresAt", expireAfterSeconds=0)
     await db.market_listings.create_index([("item.rarity", 1), ("item.type", 1)])
     await db.players.create_index("lastSeen")
+    await db.run_records.create_index([("session_id", 1), ("createdAt", -1)])
 
     await init_db()
     scheduler.start()
@@ -1994,3 +1995,247 @@ async def get_profile(session_id: str):
         return {"exists": False}
     player["_id"] = str(player["_id"])
     return {"exists": True, "player": player}
+
+
+# ── Monitor helpers ────────────────────────────────────────────────────────────
+def _read_cpu_stats() -> tuple[int, int]:
+    try:
+        with open("/proc/stat") as f:
+            line = f.readline()
+        fields = list(map(int, line.split()[1:]))
+        idle  = fields[3] + (fields[4] if len(fields) > 4 else 0)
+        total = sum(fields)
+        return total, idle
+    except Exception:
+        return 0, 0
+
+
+def _read_mem_info() -> dict:
+    info: dict = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1])
+    except Exception:
+        pass
+    return info
+
+
+def _read_disk_usage(path: str = "/") -> tuple[int, int, int]:
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(path)
+        return total, used, free
+    except Exception:
+        return 0, 0, 0
+
+
+async def _get_docker_containers() -> list:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "ps", "--format",
+            '{"name":"{{.Names}}","status":"{{.Status}}","image":"{{.Image}}"}',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        containers = []
+        for line in out.decode().strip().splitlines():
+            try:
+                containers.append(json.loads(line))
+            except Exception:
+                pass
+        return containers
+    except Exception:
+        return []
+
+
+async def _get_redis_info() -> dict:
+    r = _get_redis()
+    try:
+        info = await r.info()
+        return {
+            "used_memory_human":         info.get("used_memory_human", "N/A"),
+            "connected_clients":         info.get("connected_clients", 0),
+            "total_commands_processed":  info.get("total_commands_processed", 0),
+            "keyspace_hits":             info.get("keyspace_hits", 0),
+            "keyspace_misses":           info.get("keyspace_misses", 0),
+            "uptime_in_seconds":         info.get("uptime_in_seconds", 0),
+        }
+    except Exception:
+        return {}
+
+
+async def _get_mongo_info() -> dict:
+    db = _get_mongo()
+    try:
+        status = await db.command("serverStatus")
+        return {
+            "connections_current":   status.get("connections", {}).get("current", 0),
+            "connections_available": status.get("connections", {}).get("available", 0),
+            "opcounters":            {k: v for k, v in status.get("opcounters", {}).items()},
+            "uptime":                status.get("uptime", 0),
+        }
+    except Exception:
+        return {}
+
+
+# CPU usage needs two samples to compute delta — store previous reading
+_cpu_prev: dict = {"total": 0, "idle": 0, "percent": 0.0}
+
+
+@app.get("/api/monitor/stats")
+async def get_monitor_stats():
+    global _cpu_prev
+
+    # CPU delta
+    total, idle = _read_cpu_stats()
+    d_total = total - _cpu_prev["total"]
+    d_idle  = idle  - _cpu_prev["idle"]
+    cpu_pct = max(0.0, min(100.0, (1 - d_idle / max(d_total, 1)) * 100)) if d_total > 0 else _cpu_prev["percent"]
+    _cpu_prev = {"total": total, "idle": idle, "percent": cpu_pct}
+
+    # Memory
+    mem       = _read_mem_info()
+    mem_total = mem.get("MemTotal", 0)
+    mem_free  = mem.get("MemAvailable", mem.get("MemFree", 0))
+    mem_used  = mem_total - mem_free
+    mem_pct   = (mem_used / mem_total * 100) if mem_total > 0 else 0.0
+
+    # Disk
+    disk_total, disk_used, _ = _read_disk_usage("/")
+    disk_pct = (disk_used / disk_total * 100) if disk_total > 0 else 0.0
+
+    # Docker + Redis + MongoDB in parallel
+    results = await asyncio.gather(
+        _get_docker_containers(),
+        _get_redis_info(),
+        _get_mongo_info(),
+        return_exceptions=True,
+    )
+    containers = results[0] if not isinstance(results[0], Exception) else []
+    redis_info = results[1] if not isinstance(results[1], Exception) else {}
+    mongo_info = results[2] if not isinstance(results[2], Exception) else {}
+
+    return {
+        "ts": int(time.time() * 1000),
+        "system": {
+            "cpu_percent":   round(cpu_pct, 1),
+            "mem_total_kb":  mem_total,
+            "mem_used_kb":   mem_used,
+            "mem_percent":   round(mem_pct, 1),
+            "disk_total_gb": round(disk_total / 1024 ** 3, 2),
+            "disk_used_gb":  round(disk_used  / 1024 ** 3, 2),
+            "disk_percent":  round(disk_pct, 1),
+        },
+        "containers": containers,
+        "redis":      redis_info,
+        "mongodb":    mongo_info,
+    }
+
+
+# ── Analytics models ───────────────────────────────────────────────────────────
+class RunRecord(BaseModel):
+    session_id:       str
+    breach_level:     int
+    duration_sec:     int
+    total_cycles:     float
+    stage_reached:    str
+    modifier_used:    str = ""
+    fragments_gained: int = 0
+    equip_drops:      int = 0
+    legendary_drops:  int = 0
+    mythic_drops:     int = 0
+
+
+@app.post("/api/analytics/run")
+async def submit_run(body: RunRecord):
+    if not _valid_session(body.session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    r  = _get_redis()
+    db = _get_mongo()
+
+    rl_key = f"ratelimit:analytics_run:{body.session_id}"
+    if not await _check_rate_limit(r, rl_key, 20, 3600):
+        raise HTTPException(429, "Rate limit exceeded")
+
+    doc = body.model_dump()
+    doc["createdAt"] = time.time()
+    await db.run_records.insert_one(doc)
+    return {"ok": True}
+
+
+@app.get("/api/analytics/runs/{session_id}")
+async def get_runs(session_id: str, limit: int = Query(default=20, le=50)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    db = _get_mongo()
+    cursor = db.run_records.find(
+        {"session_id": session_id},
+        {"_id": 0},
+        sort=[("createdAt", -1)],
+        limit=limit,
+    )
+    runs = await cursor.to_list(length=limit)
+    return {"runs": runs}
+
+
+@app.get("/api/analytics/summary/{session_id}")
+async def get_summary(session_id: str):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    db = _get_mongo()
+
+    agg = await db.run_records.aggregate([
+        {"$match": {"session_id": session_id}},
+        {"$group": {
+            "_id":             None,
+            "total_runs":      {"$sum": 1},
+            "best_breach":     {"$max": "$breach_level"},
+            "total_cycles":    {"$sum": "$total_cycles"},
+            "avg_duration":    {"$avg": "$duration_sec"},
+            "total_fragments": {"$sum": "$fragments_gained"},
+            "total_drops":     {"$sum": "$equip_drops"},
+            "legendary_drops": {"$sum": "$legendary_drops"},
+            "mythic_drops":    {"$sum": "$mythic_drops"},
+        }},
+    ]).to_list(length=1)
+
+    if not agg:
+        return {"exists": False}
+
+    summary = {k: v for k, v in agg[0].items() if k != "_id"}
+
+    by_breach = await db.run_records.aggregate([
+        {"$match": {"session_id": session_id}},
+        {"$group": {
+            "_id":         "$breach_level",
+            "count":       {"$sum": 1},
+            "avg_dur":     {"$avg": "$duration_sec"},
+            "avg_cycles":  {"$avg": "$total_cycles"},
+        }},
+        {"$sort": {"_id": 1}},
+    ]).to_list(length=30)
+
+    top_mods = await db.run_records.aggregate([
+        {"$match": {"session_id": session_id, "modifier_used": {"$ne": ""}}},
+        {"$group": {"_id": "$modifier_used", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 5},
+    ]).to_list(length=5)
+
+    return {
+        "exists":  True,
+        "summary": summary,
+        "byBreach": [
+            {"breach": s["_id"], "count": s["count"],
+             "avgDuration": s["avg_dur"], "avgCycles": s["avg_cycles"]}
+            for s in by_breach
+        ],
+        "topModifiers": [{"modifier": s["_id"], "count": s["count"]} for s in top_mods],
+    }

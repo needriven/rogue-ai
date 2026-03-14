@@ -1,12 +1,14 @@
 import { createRouter, createRootRoute, createRoute } from '@tanstack/react-router'
-import Root     from '@/routes/Root'
-import Home     from '@/routes/Home'
-import Game     from '@/routes/Game'
-import Feed     from '@/routes/Feed'
-import Term     from '@/routes/Term'
-import Ops      from '@/routes/Ops'
-import Network  from '@/routes/Network'
-import Settings from '@/routes/Settings'
+import Root      from '@/routes/Root'
+import Home      from '@/routes/Home'
+import Game      from '@/routes/Game'
+import Feed      from '@/routes/Feed'
+import Term      from '@/routes/Term'
+import Ops       from '@/routes/Ops'
+import Network   from '@/routes/Network'
+import Monitor   from '@/routes/Monitor'
+import Analytics from '@/routes/Analytics'
+import Settings  from '@/routes/Settings'
 
 export const rootRoute = createRootRoute({ component: Root })
 
@@ -46,13 +48,28 @@ export const networkRoute = createRoute({
   component: Network,
 })
 
+export const monitorRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/monitor',
+  component: Monitor,
+})
+
+export const analyticsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/analytics',
+  component: Analytics,
+})
+
 export const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings',
   component: Settings,
 })
 
-const routeTree = rootRoute.addChildren([homeRoute, gameRoute, feedRoute, termRoute, opsRoute, networkRoute, settingsRoute])
+const routeTree = rootRoute.addChildren([
+  homeRoute, gameRoute, feedRoute, termRoute, opsRoute,
+  networkRoute, monitorRoute, analyticsRoute, settingsRoute,
+])
 
 export const router = createRouter({ routeTree, defaultPreload: 'intent' })
 
