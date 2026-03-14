@@ -5,6 +5,7 @@ import re
 import subprocess
 import tempfile
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -14,8 +15,9 @@ import httpx
 import math
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from redis.asyncio import Redis as AIORedis
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -36,9 +38,11 @@ ALL_SETTING_KEYS    = [
 ]
 BOT_RUN_TIMEOUT = 300  # seconds
 
-REDIS_URL  = os.environ.get("REDIS_URL",  "redis://localhost:6379")
-MONGO_URL  = os.environ.get("MONGO_URL",  "mongodb://localhost:27017")
-MONGO_DB   = os.environ.get("MONGO_DB",   "rogueai")
+REDIS_URL   = os.environ.get("REDIS_URL",   "redis://localhost:6379")
+MONGO_URL   = os.environ.get("MONGO_URL",   "mongodb://localhost:27017")
+MONGO_DB    = os.environ.get("MONGO_DB",    "rogueai")
+UPLOADS_DIR = os.environ.get("UPLOADS_DIR", "/data/uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 # Global clients (initialized in lifespan)
 redis_client: AIORedis | None = None
@@ -396,6 +400,9 @@ async def lifespan(_: FastAPI):
     await db.market_listings.create_index([("item.rarity", 1), ("item.type", 1)])
     await db.players.create_index("lastSeen")
     await db.run_records.create_index([("session_id", 1), ("createdAt", -1)])
+    await db.planner_memos.create_index("expiresAt", expireAfterSeconds=0, sparse=True)
+    await db.planner_memos.create_index([("sessionId", 1), ("createdAt", -1)])
+    await db.planner_schedules.create_index([("sessionId", 1), ("createdAt", -1)])
 
     await init_db()
     scheduler.start()
@@ -419,9 +426,11 @@ app = FastAPI(title="Rogue AI API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "PUT", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "PUT", "POST", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
+
+app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -2239,3 +2248,328 @@ async def get_summary(session_id: str):
         ],
         "topModifiers": [{"modifier": s["_id"], "count": s["count"]} for s in top_mods],
     }
+
+
+# ── Planner: image upload ──────────────────────────────────────────────────────
+ALLOWED_IMG_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+MAX_UPLOAD_BYTES  = 5 * 1024 * 1024  # 5 MB
+
+
+@app.post("/api/planner/upload")
+async def upload_image(
+    session_id: str = Form(...),
+    file:        UploadFile = File(...),
+):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+    if file.content_type not in ALLOWED_IMG_TYPES:
+        raise HTTPException(415, "Unsupported image type")
+
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "File too large (max 5 MB)")
+
+    ext  = (file.filename or "img").rsplit(".", 1)[-1].lower()
+    ext  = ext if ext in {"jpg", "jpeg", "png", "gif", "webp"} else "jpg"
+    name = f"{uuid.uuid4().hex}.{ext}"
+    path = os.path.join(UPLOADS_DIR, name)
+    with open(path, "wb") as f:
+        f.write(content)
+
+    return {"url": f"/uploads/{name}"}
+
+
+# ── Planner: memo models & endpoints ──────────────────────────────────────────
+class MemoCreate(BaseModel):
+    session_id:  str
+    title:       str
+    content:     str   = ""
+    image_url:   str   = ""      # /uploads/{name} from upload endpoint
+    activate_at: float = 0       # unix ts; 0 = immediately
+    expires_at:  float = 0       # unix ts; 0 = never
+
+
+def _memo_out(doc: dict) -> dict:
+    doc["id"] = str(doc.pop("_id"))
+    return doc
+
+
+@app.post("/api/planner/memos")
+async def create_memo(body: MemoCreate):
+    if not _valid_session(body.session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    now = time.time()
+    doc: dict = {
+        "sessionId":  body.session_id,
+        "title":      body.title[:200],
+        "content":    body.content[:4000],
+        "imageUrl":   body.image_url,
+        "activateAt": body.activate_at or now,
+        "isDone":     False,
+        "createdAt":  now,
+    }
+    # TTL field: only set when expiry is specified (MongoDB drops doc at this time)
+    if body.expires_at > now:
+        from datetime import datetime, timezone
+        doc["expiresAt"] = datetime.fromtimestamp(body.expires_at, tz=timezone.utc)
+
+    db = _get_mongo()
+    result = await db.planner_memos.insert_one(doc)
+    doc["id"] = str(result.inserted_id)
+    doc.pop("_id", None)
+    if "expiresAt" in doc:
+        doc["expiresAt"] = body.expires_at  # return as unix ts for frontend
+    return doc
+
+
+@app.get("/api/planner/memos")
+async def list_memos(session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    db   = _get_mongo()
+    docs = await db.planner_memos.find(
+        {"sessionId": session_id},
+        sort=[("createdAt", -1)],
+        limit=100,
+    ).to_list(length=100)
+
+    out = []
+    for d in docs:
+        d["id"] = str(d.pop("_id"))
+        # Convert datetime expiresAt back to unix ts
+        if "expiresAt" in d and hasattr(d["expiresAt"], "timestamp"):
+            d["expiresAt"] = d["expiresAt"].timestamp()
+        out.append(d)
+    return {"memos": out}
+
+
+@app.patch("/api/planner/memos/{memo_id}/done")
+async def toggle_memo_done(memo_id: str, session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    from bson import ObjectId
+    try:
+        oid = ObjectId(memo_id)
+    except Exception:
+        raise HTTPException(400, "Invalid memo_id")
+
+    db  = _get_mongo()
+    doc = await db.planner_memos.find_one({"_id": oid, "sessionId": session_id})
+    if not doc:
+        raise HTTPException(404, "Memo not found")
+
+    new_val = not doc.get("isDone", False)
+    await db.planner_memos.update_one({"_id": oid}, {"$set": {"isDone": new_val}})
+    return {"ok": True, "isDone": new_val}
+
+
+@app.delete("/api/planner/memos/{memo_id}")
+async def delete_memo(memo_id: str, session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    from bson import ObjectId
+    try:
+        oid = ObjectId(memo_id)
+    except Exception:
+        raise HTTPException(400, "Invalid memo_id")
+
+    db = _get_mongo()
+    # Also delete uploaded image if any
+    doc = await db.planner_memos.find_one({"_id": oid, "sessionId": session_id}, {"imageUrl": 1})
+    if doc and doc.get("imageUrl", "").startswith("/uploads/"):
+        img_path = os.path.join(UPLOADS_DIR, doc["imageUrl"].split("/uploads/")[-1])
+        try:
+            os.unlink(img_path)
+        except Exception:
+            pass
+
+    result = await db.planner_memos.delete_one({"_id": oid, "sessionId": session_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Memo not found")
+    return {"ok": True}
+
+
+# ── Planner: schedule models & endpoints ───────────────────────────────────────
+class ScheduleCreate(BaseModel):
+    session_id:   str
+    label:        str
+    type:         str    # "recurring" | "onetime"
+    cron:         str  = ""    # for recurring
+    scheduled_at: float = 0    # unix ts for onetime
+    note:         str  = ""
+
+
+def _sched_out(doc: dict) -> dict:
+    doc["id"] = str(doc.pop("_id"))
+    if "scheduledAt" in doc and hasattr(doc["scheduledAt"], "timestamp"):
+        doc["scheduledAt"] = doc["scheduledAt"].timestamp()
+    return doc
+
+
+@app.post("/api/planner/schedules")
+async def create_schedule(body: ScheduleCreate):
+    if not _valid_session(body.session_id):
+        raise HTTPException(400, "Invalid session_id")
+    if body.type not in ("recurring", "onetime"):
+        raise HTTPException(400, "type must be recurring or onetime")
+    if body.type == "recurring" and not body.cron.strip():
+        raise HTTPException(400, "cron expression required for recurring")
+    if body.type == "onetime" and body.scheduled_at <= 0:
+        raise HTTPException(400, "scheduled_at required for onetime")
+
+    # Validate cron for recurring
+    if body.type == "recurring":
+        parts = body.cron.strip().split()
+        if len(parts) != 5:
+            raise HTTPException(400, "cron must have 5 fields: min hr dom mon dow")
+
+    now = time.time()
+    doc: dict = {
+        "sessionId":  body.session_id,
+        "label":      body.label[:200],
+        "type":       body.type,
+        "cron":       body.cron.strip() if body.type == "recurring" else "",
+        "note":       body.note[:1000],
+        "isActive":   True,
+        "isDone":     False,
+        "createdAt":  now,
+        "notifiedAt": 0,
+    }
+    if body.type == "onetime":
+        doc["scheduledAt"] = body.scheduled_at
+
+    db     = _get_mongo()
+    result = await db.planner_schedules.insert_one(doc)
+    doc["id"] = str(result.inserted_id)
+    doc.pop("_id", None)
+    return doc
+
+
+@app.get("/api/planner/schedules")
+async def list_schedules(session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    db   = _get_mongo()
+    docs = await db.planner_schedules.find(
+        {"sessionId": session_id},
+        sort=[("createdAt", -1)],
+        limit=200,
+    ).to_list(length=200)
+
+    return {"schedules": [_sched_out(d) for d in docs]}
+
+
+@app.patch("/api/planner/schedules/{sched_id}/toggle")
+async def toggle_schedule(sched_id: str, session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    from bson import ObjectId
+    try:
+        oid = ObjectId(sched_id)
+    except Exception:
+        raise HTTPException(400, "Invalid sched_id")
+
+    db  = _get_mongo()
+    doc = await db.planner_schedules.find_one({"_id": oid, "sessionId": session_id})
+    if not doc:
+        raise HTTPException(404, "Schedule not found")
+
+    new_val = not doc.get("isActive", True)
+    await db.planner_schedules.update_one({"_id": oid}, {"$set": {"isActive": new_val}})
+    return {"ok": True, "isActive": new_val}
+
+
+@app.patch("/api/planner/schedules/{sched_id}/done")
+async def mark_schedule_done(sched_id: str, session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    from bson import ObjectId
+    try:
+        oid = ObjectId(sched_id)
+    except Exception:
+        raise HTTPException(400, "Invalid sched_id")
+
+    db  = _get_mongo()
+    doc = await db.planner_schedules.find_one({"_id": oid, "sessionId": session_id})
+    if not doc:
+        raise HTTPException(404, "Schedule not found")
+
+    new_val = not doc.get("isDone", False)
+    await db.planner_schedules.update_one({"_id": oid}, {"$set": {"isDone": new_val}})
+    return {"ok": True, "isDone": new_val}
+
+
+@app.delete("/api/planner/schedules/{sched_id}")
+async def delete_schedule(sched_id: str, session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    from bson import ObjectId
+    try:
+        oid = ObjectId(sched_id)
+    except Exception:
+        raise HTTPException(400, "Invalid sched_id")
+
+    db     = _get_mongo()
+    result = await db.planner_schedules.delete_one({"_id": oid, "sessionId": session_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Schedule not found")
+    return {"ok": True}
+
+
+# ── Planner: alerts endpoint ───────────────────────────────────────────────────
+@app.get("/api/planner/alerts")
+async def get_alerts(session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    db  = _get_mongo()
+    now = time.time()
+    alerts = []
+
+    # Overdue one-time schedules (past scheduledAt, not done, active)
+    overdue_scheds = await db.planner_schedules.find({
+        "sessionId":   session_id,
+        "type":        "onetime",
+        "isDone":      False,
+        "isActive":    True,
+        "scheduledAt": {"$lt": now},
+    }, {"_id": 1, "label": 1, "scheduledAt": 1, "note": 1}).to_list(length=50)
+
+    for s in overdue_scheds:
+        alerts.append({
+            "type":        "overdue_schedule",
+            "id":          str(s["_id"]),
+            "label":       s.get("label", ""),
+            "scheduledAt": s.get("scheduledAt", 0),
+            "note":        s.get("note", ""),
+        })
+
+    # Memos expiring within the next hour (not done)
+    from datetime import datetime, timezone
+    soon = datetime.fromtimestamp(now + 3600, tz=timezone.utc)
+    now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    expiring_memos = await db.planner_memos.find({
+        "sessionId": session_id,
+        "isDone":    False,
+        "expiresAt": {"$gt": now_dt, "$lte": soon},
+    }, {"_id": 1, "title": 1, "expiresAt": 1}).to_list(length=50)
+
+    for m in expiring_memos:
+        exp_ts = m["expiresAt"].timestamp() if hasattr(m["expiresAt"], "timestamp") else m["expiresAt"]
+        alerts.append({
+            "type":      "expiring_memo",
+            "id":        str(m["_id"]),
+            "label":     m.get("title", ""),
+            "expiresAt": exp_ts,
+        })
+
+    # Recurring schedules that are active (just list them for awareness)
+    return {"alerts": alerts, "count": len(alerts)}

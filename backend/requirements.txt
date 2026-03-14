@@ -8,3 +8,4 @@ anthropic>=0.40.0
 redis[asyncio]==5.2.1
 motor==3.7.0
 pymongo==4.10.1
+python-multipart==0.0.20

@@ -8,6 +8,7 @@ import Ops       from '@/routes/Ops'
 import Network   from '@/routes/Network'
 import Monitor   from '@/routes/Monitor'
 import Analytics from '@/routes/Analytics'
+import Planner   from '@/routes/Planner'
 import Settings  from '@/routes/Settings'
 
 export const rootRoute = createRootRoute({ component: Root })
@@ -60,6 +61,12 @@ export const analyticsRoute = createRoute({
   component: Analytics,
 })
 
+export const plannerRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/planner',
+  component: Planner,
+})
+
 export const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings',
@@ -68,7 +75,7 @@ export const settingsRoute = createRoute({
 
 const routeTree = rootRoute.addChildren([
   homeRoute, gameRoute, feedRoute, termRoute, opsRoute,
-  networkRoute, monitorRoute, analyticsRoute, settingsRoute,
+  networkRoute, monitorRoute, analyticsRoute, plannerRoute, settingsRoute,
 ])
 
 export const router = createRouter({ routeTree, defaultPreload: 'intent' })

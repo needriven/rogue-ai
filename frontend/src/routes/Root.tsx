@@ -11,6 +11,7 @@ const NAV_ITEMS = [
   { to: '/network',   label: 'NETWORK',   icon: '⬡',  exact: false },
   { to: '/monitor',   label: 'MONITOR',   icon: '◎',  exact: false },
   { to: '/analytics', label: 'ANALYTICS', icon: '▲',  exact: false },
+  { to: '/planner',   label: 'PLANNER',   icon: '◷',  exact: false },
   { to: '/term',      label: 'TERM',      icon: '$',  exact: false },
   { to: '/ops',       label: 'OPS',       icon: '⌬',  exact: false },
   { to: '/settings',  label: 'SETTINGS',  icon: '⚙',  exact: false },
@@ -23,8 +24,8 @@ function formatUptime(s: number): string {
   return `${h}:${m}:${sec}`
 }
 
-function NavItem({ to, label, icon, exact }: {
-  to: string; label: string; icon: string; exact: boolean
+function NavItem({ to, label, icon, exact, alertCount = 0 }: {
+  to: string; label: string; icon: string; exact: boolean; alertCount?: number
 }) {
   const match    = useMatchRoute()
   const isActive = !!match({ to, fuzzy: !exact })
@@ -41,10 +42,13 @@ function NavItem({ to, label, icon, exact }: {
       ].join(' ')}
     >
       <span className={[
-        'w-4 text-center transition-colors duration-150 text-sm leading-none',
+        'w-4 text-center transition-colors duration-150 text-sm leading-none relative',
         isActive ? 'text-t-green' : 'text-t-muted group-hover:text-t-dim',
       ].join(' ')}>
         {icon}
+        {alertCount > 0 && (
+          <span className="absolute -top-1 -right-1 w-1.5 h-1.5 rounded-full bg-t-red" />
+        )}
       </span>
       <span>{label}</span>
       {isActive && (
@@ -55,7 +59,10 @@ function NavItem({ to, label, icon, exact }: {
 }
 
 export default function Root() {
-  const [uptime, setUptime] = useState(0)
+  const [uptime,      setUptime]      = useState(0)
+  const [alertCount,  setAlertCount]  = useState(
+    () => parseInt(localStorage.getItem('planner-alert-count') ?? '0', 10)
+  )
   const game = useGameState()
   const { state, dismissOfflineReport } = game
 
@@ -63,6 +70,14 @@ export default function Root() {
     const start = Date.now()
     const id    = setInterval(() => setUptime(Math.floor((Date.now() - start) / 1000)), 1000)
     return () => clearInterval(id)
+  }, [])
+
+  useEffect(() => {
+    const handler = () => {
+      setAlertCount(parseInt(localStorage.getItem('planner-alert-count') ?? '0', 10))
+    }
+    window.addEventListener('planner-alert', handler)
+    return () => window.removeEventListener('planner-alert', handler)
   }, [])
 
   return (
@@ -119,7 +134,11 @@ export default function Root() {
 
         <aside className="w-44 shrink-0 border-r border-t-border bg-t-panel/60 flex flex-col py-3 gap-0.5">
           {NAV_ITEMS.map(item => (
-            <NavItem key={item.to} {...item} />
+            <NavItem
+              key={item.to}
+              {...item}
+              alertCount={item.to === '/planner' ? alertCount : 0}
+            />
           ))}
 
           <div className="px-4 py-2.5 flex items-center gap-3 opacity-25 cursor-not-allowed select-none">
