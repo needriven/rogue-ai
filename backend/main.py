@@ -31,9 +31,9 @@ FEED_MAX_ITEMS_PER_SOURCE = 100
 TERM_TOKEN                = os.environ.get("TERM_TOKEN", "")   # shared secret for relay auth
 
 # ── Orchestration config ───────────────────────────────────────────────────────
-MASKED_SETTING_KEYS = {"anthropic_api_key", "github_token", "slack_webhook", "discord_webhook"}
+MASKED_SETTING_KEYS = {"anthropic_api_key", "anthropic_admin_key", "github_token", "slack_webhook", "discord_webhook"}
 ALL_SETTING_KEYS    = [
-    "anthropic_api_key", "github_token", "github_username",
+    "anthropic_api_key", "anthropic_admin_key", "github_token", "github_username",
     "github_repo", "slack_webhook", "discord_webhook",
 ]
 BOT_RUN_TIMEOUT = 300  # seconds
@@ -137,6 +137,20 @@ async def init_db() -> None:
                 UNIQUE(bot_id, key)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS api_usage (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint   TEXT    NOT NULL,
+                model      TEXT    NOT NULL,
+                input_tok  INTEGER NOT NULL DEFAULT 0,
+                output_tok INTEGER NOT NULL DEFAULT 0,
+                cost_usd   REAL    NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_api_usage_created ON api_usage(created_at DESC)"
+        )
         await db.commit()
 
 
@@ -232,12 +246,13 @@ async def feed_fetcher_loop() -> None:
 
 # Env-var overrides: env key → setting key
 _ENV_OVERRIDES: dict[str, str] = {
-    "ANTHROPIC_API_KEY": "anthropic_api_key",
-    "GITHUB_TOKEN":      "github_token",
-    "GITHUB_USERNAME":   "github_username",
-    "GITHUB_REPO":       "github_repo",
-    "SLACK_WEBHOOK":     "slack_webhook",
-    "DISCORD_WEBHOOK":   "discord_webhook",
+    "ANTHROPIC_API_KEY":   "anthropic_api_key",
+    "ANTHROPIC_ADMIN_KEY": "anthropic_admin_key",
+    "GITHUB_TOKEN":        "github_token",
+    "GITHUB_USERNAME":     "github_username",
+    "GITHUB_REPO":         "github_repo",
+    "SLACK_WEBHOOK":       "slack_webhook",
+    "DISCORD_WEBHOOK":     "discord_webhook",
 }
 # Reverse map: setting key → env var name
 _SETTING_ENV: dict[str, str] = {v: k for k, v in _ENV_OVERRIDES.items()}
@@ -273,6 +288,32 @@ def _mask_value(value: str) -> str:
     if len(value) <= 4:
         return "••••"
     return "••••••••" + value[-4:]
+
+
+# ── API usage tracking ─────────────────────────────────────────────────────────
+
+# input/output price in USD per 1M tokens
+_MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "claude-haiku-4-5-20251001": (0.80,  4.00),
+    "claude-haiku-4-5":          (0.80,  4.00),
+    "claude-sonnet-4-6":         (3.00, 15.00),
+    "claude-opus-4-6":           (15.0, 75.00),
+}
+
+async def track_usage(endpoint: str, model: str, input_tok: int, output_tok: int) -> None:
+    pricing  = _MODEL_PRICING.get(model, (3.00, 15.00))
+    cost_usd = (input_tok * pricing[0] + output_tok * pricing[1]) / 1_000_000
+    now      = int(time.time() * 1000)
+    try:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "INSERT INTO api_usage (endpoint, model, input_tok, output_tok, cost_usd, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (endpoint, model, input_tok, output_tok, cost_usd, now),
+            )
+            await db.commit()
+    except Exception:
+        pass  # never fail the main request
 
 
 # ── Scheduler & bot execution ──────────────────────────────────────────────────
@@ -899,6 +940,85 @@ async def update_setting(key: str, payload: SettingPayload):
     await set_setting(key, payload.value.strip())
 
 
+# ── API Usage routes ───────────────────────────────────────────────────────────
+
+@app.get("/api/usage/stats")
+async def usage_stats():
+    now_ms      = int(time.time() * 1000)
+    day_ms      = 86_400_000
+    today_start = now_ms - day_ms
+    week_start  = now_ms - 7  * day_ms
+    month_start = now_ms - 30 * day_ms
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        periods: dict = {}
+        for label, since in [("today", today_start), ("week", week_start), ("month", month_start)]:
+            async with db.execute(
+                "SELECT SUM(input_tok) inp, SUM(output_tok) out, SUM(cost_usd) cost, COUNT(*) calls "
+                "FROM api_usage WHERE created_at >= ?", (since,)
+            ) as cur:
+                row = await cur.fetchone()
+            periods[label] = {
+                "input_tokens":  row["inp"]   or 0,
+                "output_tokens": row["out"]   or 0,
+                "cost_usd":      round(row["cost"] or 0, 6),
+                "calls":         row["calls"] or 0,
+            }
+
+        async with db.execute(
+            "SELECT model, endpoint, SUM(input_tok) inp, SUM(output_tok) out, "
+            "SUM(cost_usd) cost, COUNT(*) calls "
+            "FROM api_usage WHERE created_at >= ? "
+            "GROUP BY model, endpoint ORDER BY cost DESC",
+            (month_start,)
+        ) as cur:
+            by_model = [dict(r) for r in await cur.fetchall()]
+
+        async with db.execute(
+            "SELECT endpoint, model, input_tok, output_tok, cost_usd, created_at "
+            "FROM api_usage ORDER BY created_at DESC LIMIT 50"
+        ) as cur:
+            recent = [dict(r) for r in await cur.fetchall()]
+
+    return {"periods": periods, "by_model": by_model, "recent": recent}
+
+
+@app.get("/api/usage/admin")
+async def usage_admin():
+    admin_key = await get_setting("anthropic_admin_key")
+    if not admin_key:
+        raise HTTPException(503, "Anthropic Admin API key not configured")
+
+    cache_key = "anthropic_admin_usage"
+    if redis_client:
+        cached = await redis_client.get(cache_key)
+        if cached:
+            import json as _json
+            return _json.loads(cached)
+
+    import httpx as _httpx
+    async with _httpx.AsyncClient() as hc:
+        resp = await hc.get(
+            "https://api.anthropic.com/v1/usage",
+            headers={
+                "x-api-key":         admin_key,
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta":    "usage-2025-01-01",
+            },
+            timeout=15,
+        )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Admin API returned {resp.status_code}: {resp.text[:300]}")
+
+    data = resp.json()
+    if redis_client:
+        import json as _json
+        await redis_client.setex(cache_key, 3600, _json.dumps(data))
+    return data
+
+
 # ── Bot routes ─────────────────────────────────────────────────────────────────
 class BotPayload(BaseModel):
     name:        str = ""
@@ -1189,6 +1309,10 @@ async def ai_chat(payload: AIChatPayload, request: Request):
         system=system,
         messages=payload.messages,
     )
+    asyncio.create_task(track_usage(
+        "ai_chat", "claude-haiku-4-5-20251001",
+        response.usage.input_tokens, response.usage.output_tokens,
+    ))
     return {
         "content": response.content[0].text,
         "usage": {
@@ -1641,6 +1765,8 @@ async def ai_agent(payload: AgentPayload, request: Request):
 
     messages = [{"role": "user", "content": payload.message}]
     tool_calls_log = []
+    total_input_tok  = 0
+    total_output_tok = 0
 
     # Agentic loop
     for _ in range(6):  # max iterations
@@ -1652,6 +1778,8 @@ async def ai_agent(payload: AgentPayload, request: Request):
             messages=messages,
             extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
         )
+        total_input_tok  += response.usage.input_tokens
+        total_output_tok += response.usage.output_tokens
 
         messages.append({"role": "assistant", "content": response.content})
 
@@ -1690,13 +1818,18 @@ async def ai_agent(payload: AgentPayload, request: Request):
             if m:
                 created_bot_id = int(m.group(1))
 
+    asyncio.create_task(track_usage(
+        "ai_agent", "claude-haiku-4-5-20251001",
+        total_input_tok, total_output_tok,
+    ))
+
     return {
         "reply":          final_text,
         "tool_calls":     tool_calls_log,
         "created_bot_id": created_bot_id,
         "usage": {
-            "input_tokens":  response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
+            "input_tokens":  total_input_tok,
+            "output_tokens": total_output_tok,
         },
     }
 
@@ -3065,6 +3198,10 @@ async def process_items_with_claude(
             system=DIGEST_PROMPT,
             messages=[{"role": "user", "content": json.dumps(input_list, ensure_ascii=False)}],
         )
+        asyncio.get_event_loop().create_task(track_usage(
+            "digest", model,
+            resp.usage.input_tokens, resp.usage.output_tokens,
+        ))
         raw = resp.content[0].text.strip()
         if raw.startswith("```"):
             raw = re.sub(r"^```[a-z]*\n?", "", raw)

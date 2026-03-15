@@ -12,7 +12,13 @@ interface BotRun {
   exit_code: number | null; started_at: number; finished_at: number | null
   stdout_preview?: string; stdout?: string; stderr: string
 }
-interface Setting { key: string; is_set: boolean; display: string; masked: boolean }
+interface Setting { key: string; is_set: boolean; display: string; masked: boolean; from_env: boolean }
+interface UsagePeriod { input_tokens: number; output_tokens: number; cost_usd: number; calls: number }
+interface UsageByModel { model: string; endpoint: string; inp: number; out: number; cost: number; calls: number }
+interface UsageRecent { endpoint: string; model: string; input_tok: number; output_tok: number; cost_usd: number; created_at: number }
+interface UsageStats { periods: Record<'today'|'week'|'month', UsagePeriod>; by_model: UsageByModel[]; recent: UsageRecent[] }
+interface AdminUsageDay { date: string; model: string; input_tokens: number; output_tokens: number; cache_read_input_tokens?: number }
+interface AdminUsage { data: AdminUsageDay[] }
 interface BotDataEntry { value: unknown; updated_at: number }
 interface BotData { [key: string]: BotDataEntry }
 interface ContribDay { date: string; contributionCount: number }
@@ -98,11 +104,12 @@ const CONTRIB_COLOR = (n: number) =>
              : 'bg-t-green'
 
 // ── Tab bar ───────────────────────────────────────────────────────────────────
-type Tab = 'bots' | 'github' | 'ai' | 'settings'
+type Tab = 'bots' | 'github' | 'ai' | 'usage' | 'settings'
 const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: 'bots',     label: 'BOTS',     icon: '◈' },
   { id: 'github',   label: 'GITHUB',   icon: '⌥' },
   { id: 'ai',       label: 'AI',       icon: '✦' },
+  { id: 'usage',    label: 'USAGE',    icon: '$' },
   { id: 'settings', label: 'SETTINGS', icon: '⚙' },
 ]
 
@@ -1000,12 +1007,166 @@ function AiPanel({ onSwitchToBots }: { onSwitchToBots: (botId: number) => void }
   )
 }
 
+// ── USAGE PANEL ───────────────────────────────────────────────────────────────
+function UsagePanel() {
+  const { data: stats, isLoading: loadingStats, refetch } = useQuery<UsageStats>({
+    queryKey: ['usage-stats'],
+    queryFn:  () => apiFetch('/usage/stats'),
+    refetchInterval: 30_000,
+  })
+  const { data: adminData, isLoading: loadingAdmin, error: adminErr } = useQuery<AdminUsage>({
+    queryKey: ['usage-admin'],
+    queryFn:  () => apiFetch('/usage/admin'),
+    retry: false,
+  })
+
+  const fmt = (n: number) => n >= 1_000_000 ? `${(n/1_000_000).toFixed(2)}M` : n >= 1_000 ? `${(n/1_000).toFixed(1)}k` : String(n)
+  const fmtCost = (n: number) => n < 0.001 ? `$${(n * 1000).toFixed(3)}m` : `$${n.toFixed(4)}`
+  const fmtTime = (ms: number) => new Date(ms).toLocaleString('ko-KR', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+
+  // Aggregate admin data by model for last 7 days
+  const adminByModel = (() => {
+    if (!adminData?.data) return []
+    const cutoff = Date.now() - 7 * 86_400_000
+    const map: Record<string, { input: number; output: number }> = {}
+    for (const row of adminData.data) {
+      if (new Date(row.date).getTime() < cutoff) continue
+      if (!map[row.model]) map[row.model] = { input: 0, output: 0 }
+      map[row.model].input  += row.input_tokens
+      map[row.model].output += row.output_tokens
+    }
+    return Object.entries(map).map(([model, v]) => ({ model, ...v }))
+  })()
+
+  const PERIOD_LABELS: Record<string, string> = { today: 'TODAY', week: '7 DAYS', month: '30 DAYS' }
+
+  return (
+    <div className="p-4 flex flex-col gap-6 overflow-y-auto h-full">
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-t-muted tracking-widest">API COST MONITORING</p>
+        <button onClick={() => refetch()} className="text-[10px] text-t-dim hover:text-t-text px-2 py-1 border border-t-border">
+          REFRESH
+        </button>
+      </div>
+
+      {/* Self-tracked period cards */}
+      {loadingStats ? (
+        <p className="text-xs text-t-dim animate-pulse">Loading…</p>
+      ) : stats ? (
+        <>
+          <div className="grid grid-cols-3 gap-3">
+            {(Object.entries(stats.periods) as [string, UsagePeriod][]).map(([period, p]) => (
+              <div key={period} className="border border-t-border p-3 flex flex-col gap-1">
+                <p className="text-[10px] text-t-muted tracking-widest">{PERIOD_LABELS[period]}</p>
+                <p className="text-lg font-mono text-t-green">{fmtCost(p.cost_usd)}</p>
+                <p className="text-[10px] text-t-dim">{fmt(p.input_tokens + p.output_tokens)} tok · {p.calls} calls</p>
+              </div>
+            ))}
+          </div>
+
+          {/* By model breakdown */}
+          {stats.by_model.length > 0 && (
+            <div className="border border-t-border">
+              <p className="text-[10px] text-t-muted tracking-widest px-3 py-2 border-b border-t-border">30-DAY BREAKDOWN (SELF-TRACKED)</p>
+              <table className="w-full text-[10px] font-mono">
+                <thead>
+                  <tr className="text-t-dim border-b border-t-border">
+                    <th className="text-left px-3 py-1.5">ENDPOINT</th>
+                    <th className="text-left px-3 py-1.5">MODEL</th>
+                    <th className="text-right px-3 py-1.5">IN</th>
+                    <th className="text-right px-3 py-1.5">OUT</th>
+                    <th className="text-right px-3 py-1.5">CALLS</th>
+                    <th className="text-right px-3 py-1.5">COST</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {stats.by_model.map((r, i) => (
+                    <tr key={i} className="border-b border-t-border/50 hover:bg-white/2">
+                      <td className="px-3 py-1.5 text-t-text">{r.endpoint}</td>
+                      <td className="px-3 py-1.5 text-t-dim">{r.model.replace('claude-', '')}</td>
+                      <td className="px-3 py-1.5 text-right text-t-dim">{fmt(r.inp)}</td>
+                      <td className="px-3 py-1.5 text-right text-t-dim">{fmt(r.out)}</td>
+                      <td className="px-3 py-1.5 text-right text-t-dim">{r.calls}</td>
+                      <td className="px-3 py-1.5 text-right text-t-green">{fmtCost(r.cost)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Recent calls */}
+          {stats.recent.length > 0 && (
+            <div className="border border-t-border">
+              <p className="text-[10px] text-t-muted tracking-widest px-3 py-2 border-b border-t-border">RECENT CALLS</p>
+              <div className="max-h-48 overflow-y-auto">
+                {stats.recent.map((r, i) => (
+                  <div key={i} className="flex items-center gap-3 px-3 py-1.5 border-b border-t-border/40 text-[10px] hover:bg-white/2">
+                    <span className="text-t-dim w-28 shrink-0">{fmtTime(r.created_at)}</span>
+                    <span className="text-t-text w-16 shrink-0">{r.endpoint}</span>
+                    <span className="text-t-dim flex-1 truncate">{r.model.replace('claude-', '')}</span>
+                    <span className="text-t-dim shrink-0">{fmt(r.input_tok + r.output_tok)} tok</span>
+                    <span className="text-t-green shrink-0">{fmtCost(r.cost_usd)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      ) : null}
+
+      {/* Anthropic Admin API section */}
+      <div className="border border-t-border">
+        <p className="text-[10px] text-t-muted tracking-widest px-3 py-2 border-b border-t-border">
+          ANTHROPIC ADMIN API <span className="text-t-dim ml-2">(official · 1h cache)</span>
+        </p>
+        {loadingAdmin ? (
+          <p className="text-xs text-t-dim animate-pulse px-3 py-3">Fetching from Anthropic…</p>
+        ) : adminErr ? (
+          <p className="text-[10px] text-t-amber px-3 py-3">
+            {String(adminErr).includes('503')
+              ? 'Admin API key not configured — add ANTHROPIC_ADMIN_KEY in Settings.'
+              : `Error: ${String(adminErr)}`}
+          </p>
+        ) : adminByModel.length > 0 ? (
+          <table className="w-full text-[10px] font-mono">
+            <thead>
+              <tr className="text-t-dim border-b border-t-border">
+                <th className="text-left px-3 py-1.5">MODEL</th>
+                <th className="text-right px-3 py-1.5">INPUT (7D)</th>
+                <th className="text-right px-3 py-1.5">OUTPUT (7D)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {adminByModel.map((r, i) => (
+                <tr key={i} className="border-b border-t-border/50">
+                  <td className="px-3 py-1.5 text-t-text">{r.model.replace('claude-', '')}</td>
+                  <td className="px-3 py-1.5 text-right text-t-dim">{fmt(r.input)}</td>
+                  <td className="px-3 py-1.5 text-right text-t-dim">{fmt(r.output)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="text-[10px] text-t-dim px-3 py-3">No data available for last 7 days.</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
+
 // ── SETTINGS PANEL ────────────────────────────────────────────────────────────
 const SETTING_META: Record<string, { label: string; description: string; placeholder: string }> = {
   anthropic_api_key: {
     label:       'ANTHROPIC_API_KEY',
     description: 'Used for AI chat (claude-haiku). Cost-optimized — ~$0.001 per message.',
     placeholder: 'sk-ant-api03-…',
+  },
+  anthropic_admin_key: {
+    label:       'ANTHROPIC_ADMIN_KEY',
+    description: 'Admin API Key from Anthropic Console → Settings → Admin API Keys. Used to fetch official billing data.',
+    placeholder: 'sk-ant-admin03-…',
   },
   github_token: {
     label:       'GITHUB_TOKEN',
@@ -1070,6 +1231,7 @@ function SettingsPanel() {
       <p className="text-xs text-t-dim -mt-4">
         Secrets are stored in the OCI VM database and masked in the UI.
         Values are never sent back to the browser after saving.
+        Keys managed via <code className="text-t-amber">.env</code> are read-only in the UI.
       </p>
 
       {settings.map(s => {
@@ -1078,14 +1240,17 @@ function SettingsPanel() {
         const isRev  = revealed[s.key]
 
         return (
-          <div key={s.key} className="border border-t-border p-3 flex flex-col gap-2">
+          <div key={s.key} className={`border p-3 flex flex-col gap-2 ${s.from_env ? 'border-t-amber/40' : 'border-t-border'}`}>
             <div className="flex items-center gap-2">
               <span className={`text-[10px] w-2 ${s.is_set ? 'text-t-green' : 'text-t-muted'}`}>●</span>
               <p className="text-xs text-t-text tracking-wider">{meta?.label ?? s.key}</p>
-              {s.is_set && !edited && (
+              {s.from_env && (
+                <span className="ml-auto text-[10px] text-t-amber border border-t-amber/40 px-1" title="Managed via .env — edit on the server">🔒 ENV</span>
+              )}
+              {!s.from_env && s.is_set && !edited && (
                 <span className="ml-auto text-[10px] text-t-green border border-t-green/30 px-1">CONFIGURED</span>
               )}
-              {edited && (
+              {!s.from_env && edited && (
                 <span className="ml-auto text-[10px] text-t-amber border border-t-amber/30 px-1">UNSAVED</span>
               )}
             </div>
@@ -1094,33 +1259,39 @@ function SettingsPanel() {
               <p className="text-[10px] text-t-muted leading-4">{meta.description}</p>
             )}
 
-            <div className="flex items-center gap-2">
-              <input
-                type={s.masked && !isRev ? 'password' : 'text'}
-                className={inp}
-                placeholder={s.is_set ? s.display || '(configured)' : meta?.placeholder ?? ''}
-                value={vals[s.key] ?? ''}
-                onChange={e => setVals(v => ({ ...v, [s.key]: e.target.value }))}
-                autoComplete="off"
-              />
-              {s.masked && (
+            {s.from_env ? (
+              <p className="text-[10px] text-t-dim font-mono italic">
+                Loaded from environment variable — edit <span className="text-t-amber">.env</span> on the server to change.
+              </p>
+            ) : (
+              <div className="flex items-center gap-2">
+                <input
+                  type={s.masked && !isRev ? 'password' : 'text'}
+                  className={inp}
+                  placeholder={s.is_set ? s.display || '(configured)' : meta?.placeholder ?? ''}
+                  value={vals[s.key] ?? ''}
+                  onChange={e => setVals(v => ({ ...v, [s.key]: e.target.value }))}
+                  autoComplete="off"
+                />
+                {s.masked && (
+                  <button
+                    onClick={() => setRevealed(r => ({ ...r, [s.key]: !r[s.key] }))}
+                    className="text-xs px-2 py-1.5 border border-t-border text-t-dim hover:text-t-text"
+                    title={isRev ? 'hide' : 'show'}
+                  >
+                    {isRev ? '🙈' : '👁'}
+                  </button>
+                )}
                 <button
-                  onClick={() => setRevealed(r => ({ ...r, [s.key]: !r[s.key] }))}
-                  className="text-xs px-2 py-1.5 border border-t-border text-t-dim hover:text-t-text"
-                  title={isRev ? 'hide' : 'show'}
+                  onClick={() => save(s.key)}
+                  disabled={saving[s.key] || !edited}
+                  className="text-xs px-3 py-1.5 border border-t-green text-t-green hover:bg-t-green-glow
+                             disabled:opacity-30 disabled:cursor-not-allowed"
                 >
-                  {isRev ? '🙈' : '👁'}
+                  {saved[s.key] ? '✓ SAVED' : saving[s.key] ? '…' : 'SAVE'}
                 </button>
-              )}
-              <button
-                onClick={() => save(s.key)}
-                disabled={saving[s.key] || !edited}
-                className="text-xs px-3 py-1.5 border border-t-green text-t-green hover:bg-t-green-glow
-                           disabled:opacity-30 disabled:cursor-not-allowed"
-              >
-                {saved[s.key] ? '✓ SAVED' : saving[s.key] ? '…' : 'SAVE'}
-              </button>
-            </div>
+              </div>
+            )}
           </div>
         )
       })}
@@ -1168,6 +1339,7 @@ export default function Ops() {
         {tab === 'bots'     && <BotsPanel />}
         {tab === 'github'   && <GitHubPanel />}
         {tab === 'ai'       && <AiPanel onSwitchToBots={() => setTab('bots')} />}
+        {tab === 'usage'    && <UsagePanel />}
         {tab === 'settings' && <SettingsPanel />}
       </div>
     </div>
