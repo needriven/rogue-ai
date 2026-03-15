@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -36,6 +36,23 @@ async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
   if (!res.ok) throw new Error(await res.text().catch(() => res.statusText))
   if (res.status === 204) return undefined as T
   return res.json()
+}
+
+// ── Read tracking (localStorage) ─────────────────────────────────────────────
+const READ_KEY = 'feed-read-ids'
+const MAX_READ = 2000  // cap stored IDs to avoid unbounded growth
+
+function loadReadIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(READ_KEY)
+    return new Set(raw ? JSON.parse(raw) : [])
+  } catch { return new Set() }
+}
+
+function saveReadIds(ids: Set<string>): void {
+  // Keep only the most recent MAX_READ IDs
+  const arr = [...ids].slice(-MAX_READ)
+  localStorage.setItem(READ_KEY, JSON.stringify(arr))
 }
 
 // ── Tag colors ────────────────────────────────────────────────────────────────
@@ -121,11 +138,7 @@ function AddSourceForm({ onAdded }: { onAdded: () => void }) {
 }
 
 // ── Source list ───────────────────────────────────────────────────────────────
-function SourceList({
-  sources,
-  onRemove,
-  onRefresh,
-}: {
+function SourceList({ sources, onRemove, onRefresh }: {
   sources:   FeedSource[]
   onRemove:  (id: number) => void
   onRefresh: (id: number) => void
@@ -148,16 +161,8 @@ function SourceList({
               {s.item_count} items
               {s.last_fetched ? ` · ${timeAgo(s.last_fetched)}` : ' · never'}
             </span>
-            <button
-              onClick={() => onRefresh(s.id)}
-              className="shrink-0 text-t-dim hover:text-t-green transition-colors px-1"
-              title="Refresh"
-            >↻</button>
-            <button
-              onClick={() => onRemove(s.id)}
-              className="shrink-0 text-red-800 hover:text-red-400 transition-colors px-1"
-              title="Remove"
-            >✕</button>
+            <button onClick={() => onRefresh(s.id)} className="shrink-0 text-t-dim hover:text-t-green transition-colors px-1" title="Refresh">↻</button>
+            <button onClick={() => onRemove(s.id)} className="shrink-0 text-red-800 hover:text-red-400 transition-colors px-1" title="Remove">✕</button>
           </div>
         ))}
       </div>
@@ -166,16 +171,31 @@ function SourceList({
 }
 
 // ── Feed item card ────────────────────────────────────────────────────────────
-function FeedCard({ item }: { item: FeedItem }) {
+function FeedCard({ item, isRead, onRead }: {
+  item:   FeedItem
+  isRead: boolean
+  onRead: (id: number) => void
+}) {
   const [expanded, setExpanded] = useState(false)
   const pub = item.published ? timeAgo(item.published) : ''
 
+  const handleLinkClick = () => onRead(item.id)
+  const handleExpand    = () => {
+    setExpanded(v => !v)
+    if (!isRead) onRead(item.id)
+  }
+
   return (
-    <div className="border border-t-border/50 hover:border-t-border transition-colors
-                    bg-t-panel/20 hover:bg-t-panel/40">
+    <div className={[
+      'border border-t-border/50 hover:border-t-border transition-colors',
+      isRead ? 'bg-t-panel/10 opacity-60' : 'bg-t-panel/20 hover:bg-t-panel/40',
+    ].join(' ')}>
       <div className="p-3">
         {/* Header row */}
         <div className="flex items-start gap-2 mb-1">
+          {!isRead && (
+            <span className="w-1.5 h-1.5 rounded-full bg-t-green mt-1.5 shrink-0 animate-glow-pulse" />
+          )}
           <span className={`shrink-0 border text-xs px-1 py-0.5 tracking-wider ${tagColor(item.tag)}`}>
             {item.tag}
           </span>
@@ -183,39 +203,42 @@ function FeedCard({ item }: { item: FeedItem }) {
             href={item.link}
             target="_blank"
             rel="noopener noreferrer"
-            className="flex-1 text-xs text-t-text hover:text-t-green transition-colors
-                       leading-relaxed line-clamp-2"
-            onClick={e => e.stopPropagation()}
+            onClick={handleLinkClick}
+            className={[
+              'flex-1 text-xs transition-colors leading-relaxed line-clamp-2',
+              isRead ? 'text-t-dim hover:text-t-muted' : 'text-t-text hover:text-t-green',
+            ].join(' ')}
           >
             {item.title}
           </a>
         </div>
 
         {/* Meta row */}
-        <div className="flex items-center gap-3 text-xs text-t-muted mt-1.5">
+        <div className="flex items-center gap-3 text-xs text-t-muted mt-1.5 pl-3.5">
           <span className="truncate">{item.source_name}</span>
-          {pub && (
-            <>
-              <span>·</span>
-              <span className="shrink-0">{pub}</span>
-            </>
-          )}
+          {pub && <><span>·</span><span className="shrink-0">{pub}</span></>}
           {item.summary && (
             <>
               <span>·</span>
-              <button
-                onClick={() => setExpanded(v => !v)}
-                className="shrink-0 hover:text-t-dim transition-colors"
-              >
+              <button onClick={handleExpand} className="shrink-0 hover:text-t-dim transition-colors">
                 {expanded ? '▲ less' : '▼ more'}
               </button>
             </>
+          )}
+          {!isRead && (
+            <button
+              onClick={() => onRead(item.id)}
+              className="shrink-0 ml-auto hover:text-t-dim transition-colors"
+              title="Mark as read"
+            >
+              ✓
+            </button>
           )}
         </div>
 
         {/* Expandable summary */}
         {expanded && item.summary && (
-          <p className="mt-2 text-xs text-t-dim leading-relaxed border-t border-t-border/30 pt-2">
+          <p className="mt-2 text-xs text-t-dim leading-relaxed border-t border-t-border/30 pt-2 pl-3.5">
             {item.summary.replace(/<[^>]+>/g, '').slice(0, 400)}
             {item.summary.length > 400 ? '…' : ''}
           </p>
@@ -227,9 +250,10 @@ function FeedCard({ item }: { item: FeedItem }) {
 
 // ── Feed page ─────────────────────────────────────────────────────────────────
 export default function Feed() {
-  const qc           = useQueryClient()
-  const [tag, setTag] = useState<string | null>(null)
+  const qc = useQueryClient()
+  const [tag,         setTag]         = useState<string | null>(null)
   const [showSources, setShowSources] = useState(false)
+  const [readIds,     setReadIds]     = useState<Set<string>>(loadReadIds)
 
   const { data: sources = [], refetch: refetchSources } = useQuery<FeedSource[]>({
     queryKey: ['feed-sources'],
@@ -240,12 +264,31 @@ export default function Feed() {
   const { data: items = [], isFetching } = useQuery<FeedItem[]>({
     queryKey: ['feed-items', tag],
     queryFn:  () => apiFetch(`/api/feed${tag ? `?tag=${encodeURIComponent(tag)}` : '?limit=100'}`),
-    staleTime:    60_000,
-    refetchInterval: 5 * 60_000, // auto-refresh every 5 min
+    staleTime:       60_000,
+    refetchInterval: 5 * 60_000,
   })
 
-  // All unique tags from sources
-  const allTags = [...new Set(sources.map(s => s.tag))].sort()
+  // Persist readIds on change
+  useEffect(() => { saveReadIds(readIds) }, [readIds])
+
+  const markRead = useCallback((id: number) => {
+    setReadIds(prev => {
+      const next = new Set(prev)
+      next.add(String(id))
+      return next
+    })
+  }, [])
+
+  const markAllRead = useCallback(() => {
+    setReadIds(prev => {
+      const next = new Set(prev)
+      items.forEach(i => next.add(String(i.id)))
+      return next
+    })
+  }, [items])
+
+  const allTags   = [...new Set(sources.map(s => s.tag))].sort()
+  const unreadCnt = items.filter(i => !readIds.has(String(i.id))).length
 
   const removeMut = useMutation({
     mutationFn: (id: number) => apiFetch(`/api/feed/sources/${id}`, { method: 'DELETE' }),
@@ -268,7 +311,7 @@ export default function Feed() {
 
       {/* ── Header ──────────────────────────────────────────────────── */}
       <div className="shrink-0 border-b border-t-border bg-t-panel/60 px-5 py-2.5
-                      flex items-center gap-4">
+                      flex items-center gap-4 flex-wrap">
         <span className="text-xs text-t-green font-semibold tracking-widest">FEED</span>
         <span className="text-t-muted text-xs">//</span>
 
@@ -292,8 +335,8 @@ export default function Feed() {
               className={[
                 'text-xs px-2 py-0.5 border tracking-wider transition-colors',
                 tag === t
-                  ? `border-t-green text-t-green bg-t-green/10`
-                  : `border-t-border/40 text-t-muted hover:text-t-dim`,
+                  ? 'border-t-green text-t-green bg-t-green/10'
+                  : 'border-t-border/40 text-t-muted hover:text-t-dim',
               ].join(' ')}
             >
               {t.toUpperCase()}
@@ -301,10 +344,25 @@ export default function Feed() {
           ))}
         </div>
 
-        <div className="ml-auto flex items-center gap-2">
-          {isFetching && (
-            <span className="text-xs text-t-muted animate-pulse">SYNCING...</span>
+        <div className="ml-auto flex items-center gap-2 flex-wrap">
+          {isFetching && <span className="text-xs text-t-muted animate-pulse">SYNCING...</span>}
+
+          {/* Unread badge */}
+          {unreadCnt > 0 && (
+            <span className="text-xs text-t-green tabular-nums">
+              {unreadCnt} UNREAD
+            </span>
           )}
+          {unreadCnt > 0 && (
+            <button
+              onClick={markAllRead}
+              className="text-xs px-2 py-1 border border-t-border/40 text-t-dim
+                         hover:border-t-green hover:text-t-green transition-colors tracking-wider"
+            >
+              MARK ALL READ
+            </button>
+          )}
+
           <span className="text-xs text-t-muted">{items.length} items</span>
           <button
             onClick={() => refreshMut.mutate(null)}
@@ -353,7 +411,12 @@ export default function Feed() {
         )}
         <div className="space-y-1.5 max-w-3xl">
           {items.map(item => (
-            <FeedCard key={item.id} item={item} />
+            <FeedCard
+              key={item.id}
+              item={item}
+              isRead={readIds.has(String(item.id))}
+              onRead={markRead}
+            />
           ))}
         </div>
       </div>

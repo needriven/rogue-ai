@@ -35,6 +35,11 @@ interface Summary {
   mythic_drops:    number
 }
 
+interface StageDist {
+  stage: string
+  count: number
+}
+
 interface AnalyticsData {
   exists:      boolean
   summary?:    Summary
@@ -76,6 +81,8 @@ const MODIFIER_NAMES: Record<string, string> = {
   cold_storage:       'COLD_STORAGE',
 }
 
+const STAGE_ORDER = ['genesis', 'propagation', 'emergence', 'dominance', 'singularity']
+
 // ── Mini bar chart ─────────────────────────────────────────────────────────────
 function BreachBar({ breach, count, avgDuration, maxCount }: BreachStat & { maxCount: number }) {
   const pct = maxCount > 0 ? (count / maxCount) * 100 : 0
@@ -93,6 +100,38 @@ function BreachBar({ breach, count, avgDuration, maxCount }: BreachStat & { maxC
       </div>
       <span className="w-24 text-right text-t-dim shrink-0 tabular-nums">
         {formatDuration(Math.floor(avgDuration))}
+      </span>
+    </div>
+  )
+}
+
+// ── Stage bar ──────────────────────────────────────────────────────────────────
+function StageBar({ stage, count, maxCount }: StageDist & { maxCount: number }) {
+  const pct      = maxCount > 0 ? (count / maxCount) * 100 : 0
+  const barColors: Record<string, string> = {
+    genesis:     'bg-t-border/60 border-t-dim',
+    propagation: 'bg-cyan-900/60 border-cyan-500',
+    emergence:   'bg-amber-900/60 border-amber-500',
+    dominance:   'bg-red-900/60 border-red-500',
+    singularity: 'bg-purple-900/60 border-purple-500',
+  }
+  const barCls = barColors[stage] ?? 'bg-t-border/60 border-t-dim'
+  return (
+    <div className="flex items-center gap-3 text-xs">
+      <span className={`w-24 text-right shrink-0 ${stageColor(stage)}`}>
+        {stage.toUpperCase()}
+      </span>
+      <div className="flex-1 h-4 bg-t-border/40 relative overflow-hidden">
+        <div
+          className={`h-full border-r transition-all duration-500 ${barCls}`}
+          style={{ width: `${pct}%` }}
+        />
+        <span className="absolute inset-0 flex items-center pl-1 text-t-dim">
+          {count} run{count !== 1 ? 's' : ''}
+        </span>
+      </div>
+      <span className="w-12 text-right text-t-muted shrink-0 tabular-nums">
+        {maxCount > 0 ? `${((count / maxCount) * 100).toFixed(0)}%` : '—'}
       </span>
     </div>
   )
@@ -140,25 +179,31 @@ function StatCard({ label, value, sub }: { label: string; value: string; sub?: s
 // ── Main component ─────────────────────────────────────────────────────────────
 export default function Analytics() {
   const [sessionId] = useState(() => localStorage.getItem('rogue-ai-session') ?? '')
-  const [summary,   setSummary]  = useState<AnalyticsData | null>(null)
-  const [runs,      setRuns]     = useState<RunRecord[]>([])
-  const [loading,   setLoading]  = useState(true)
-  const [error,     setError]    = useState<string | null>(null)
-  const [tab,       setTab]      = useState<'overview' | 'history'>('overview')
+  const [summary,   setSummary]   = useState<AnalyticsData | null>(null)
+  const [stageDist, setStageDist] = useState<StageDist[]>([])
+  const [runs,      setRuns]      = useState<RunRecord[]>([])
+  const [loading,   setLoading]   = useState(true)
+  const [error,     setError]     = useState<string | null>(null)
+  const [tab,       setTab]       = useState<'overview' | 'history'>('overview')
 
   const load = useCallback(async () => {
     if (!sessionId) { setLoading(false); return }
     setLoading(true)
     try {
-      const [sumRes, runsRes] = await Promise.all([
+      const [sumRes, runsRes, stageRes] = await Promise.all([
         fetch(`${API}/summary/${sessionId}`),
         fetch(`${API}/runs/${sessionId}?limit=50`),
+        fetch(`${API}/stage-dist/${sessionId}`),
       ])
       if (!sumRes.ok || !runsRes.ok) throw new Error('API error')
-      const sumJson  = await sumRes.json()  as AnalyticsData
-      const runsJson = await runsRes.json() as { runs: RunRecord[] }
+      const sumJson   = await sumRes.json()   as AnalyticsData
+      const runsJson  = await runsRes.json()  as { runs: RunRecord[] }
       setSummary(sumJson)
       setRuns(runsJson.runs)
+      if (stageRes.ok) {
+        const stageJson = await stageRes.json() as { distribution: StageDist[] }
+        setStageDist(stageJson.distribution)
+      }
       setError(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unknown error')
@@ -279,6 +324,30 @@ export default function Analytics() {
                   const max = Math.max(...summary.byBreach!.map(b => b.count))
                   return summary.byBreach!.map(b => (
                     <BreachBar key={b.breach} {...b} maxCount={max} />
+                  ))
+                })()}
+              </div>
+            </div>
+          )}
+
+          {/* Stage distribution */}
+          {stageDist.length > 0 && (
+            <div className="border border-t-border bg-t-panel/60 p-4">
+              <h3 className="text-xs font-semibold text-t-green tracking-widest mb-3">
+                STAGE DISTRIBUTION
+              </h3>
+              <div className="flex text-[10px] text-t-muted justify-between mb-1 px-[6.5rem]">
+                <span>RUNS</span>
+                <span>%</span>
+              </div>
+              <div className="space-y-1.5">
+                {(() => {
+                  const ordered = STAGE_ORDER
+                    .map(s => stageDist.find(d => d.stage === s))
+                    .filter(Boolean) as StageDist[]
+                  const max = Math.max(...ordered.map(d => d.count))
+                  return ordered.map(d => (
+                    <StageBar key={d.stage} {...d} maxCount={max} />
                   ))
                 })()}
               </div>

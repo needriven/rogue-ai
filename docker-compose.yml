@@ -7,6 +7,7 @@ services:
     restart: unless-stopped
     volumes:
       - api-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - DATABASE_PATH=/data/saves.db
       - TERM_TOKEN=${TERM_TOKEN:-}

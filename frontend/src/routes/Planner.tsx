@@ -37,6 +37,13 @@ interface Alert {
   note?:        string
 }
 
+interface FiredNotification {
+  id:      string
+  label:   string
+  firedAt: number
+  schedId: string
+}
+
 type PlannerTab = 'memos' | 'scheduler' | 'alerts'
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -210,12 +217,27 @@ function ImageUpload({ onUploaded }: { onUploaded: (url: string) => void }) {
 }
 
 // ── Memo Card ─────────────────────────────────────────────────────────────────
-function MemoCard({ memo, onToggle, onDelete }: {
+function toLocalInput(ts: number): string {
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function MemoCard({ memo, onToggle, onDelete, onUpdate }: {
   memo:     Memo
   onToggle: (id: string) => void
   onDelete: (id: string) => void
+  onUpdate: (id: string, patch: object) => Promise<void>
 }) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded,  setExpanded]  = useState(false)
+  const [editing,   setEditing]   = useState(false)
+  const [eTitle,    setETitle]    = useState(memo.title)
+  const [eContent,  setEContent]  = useState(memo.content)
+  const [eActivate, setEActivate] = useState(() => toLocalInput(memo.activateAt))
+  const [eExpires,  setEExpires]  = useState(() => toLocalInput(memo.expiresAt ?? 0))
+  const [saving,    setSaving]    = useState(false)
+
   const now    = Date.now() / 1000
   const active = memo.activateAt <= now
   const expSec = memo.expiresAt ?? 0
@@ -228,6 +250,18 @@ function MemoCard({ memo, onToggle, onDelete }: {
   else if (expired) { statusColor = 'text-t-red'; statusLabel = 'EXPIRED' }
   else if (expiring) { statusColor = 'text-t-amber'; statusLabel = `EXPIRES ${countdown(expSec)}` }
   else if (active) { statusColor = 'text-t-green'; statusLabel = 'ACTIVE' }
+
+  const saveEdit = async () => {
+    setSaving(true)
+    await onUpdate(memo.id, {
+      title:       eTitle.trim() || memo.title,
+      content:     eContent,
+      activate_at: fromLocalInput(eActivate),
+      expires_at:  fromLocalInput(eExpires),
+    })
+    setSaving(false)
+    setEditing(false)
+  }
 
   return (
     <div className={`border border-t-border p-3 space-y-2 transition-opacity ${memo.isDone ? 'opacity-50' : ''}`}>
@@ -242,108 +276,204 @@ function MemoCard({ memo, onToggle, onDelete }: {
         </button>
 
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className={`text-xs font-semibold ${memo.isDone ? 'line-through text-t-muted' : 'text-t-text'}`}>
-              {memo.title}
-            </span>
-            <span className={`text-[10px] ${statusColor}`}>{statusLabel}</span>
-          </div>
-          {memo.content && (
-            <p className={`text-[11px] mt-1 ${expanded ? '' : 'line-clamp-2'} text-t-dim`}>
-              {memo.content}
-            </p>
+          {editing ? (
+            <div className="space-y-2">
+              <Input
+                value={eTitle}
+                onChange={e => setETitle(e.target.value)}
+                placeholder="Title..."
+              />
+              <Textarea
+                value={eContent}
+                onChange={e => setEContent(e.target.value)}
+                placeholder="Content..."
+              />
+              <div className="grid grid-cols-2 gap-2">
+                <Input
+                  label="ACTIVATE AT"
+                  type="datetime-local"
+                  value={eActivate}
+                  onChange={e => setEActivate(e.target.value)}
+                />
+                <Input
+                  label="EXPIRES AT"
+                  type="datetime-local"
+                  value={eExpires}
+                  onChange={e => setEExpires(e.target.value)}
+                />
+              </div>
+              <div className="flex gap-2">
+                <Btn variant="success" onClick={saveEdit} disabled={saving}>
+                  {saving ? 'SAVING...' : 'SAVE'}
+                </Btn>
+                <Btn onClick={() => setEditing(false)}>CANCEL</Btn>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className={`text-xs font-semibold ${memo.isDone ? 'line-through text-t-muted' : 'text-t-text'}`}>
+                  {memo.title}
+                </span>
+                <span className={`text-[10px] ${statusColor}`}>{statusLabel}</span>
+              </div>
+              {memo.content && (
+                <p className={`text-[11px] mt-1 ${expanded ? '' : 'line-clamp-2'} text-t-dim`}>
+                  {memo.content}
+                </p>
+              )}
+              {memo.content && memo.content.length > 120 && (
+                <button onClick={() => setExpanded(e => !e)} className="text-[10px] text-t-muted hover:text-t-dim">
+                  {expanded ? '▲ COLLAPSE' : '▼ EXPAND'}
+                </button>
+              )}
+              {memo.imageUrl && (
+                <img
+                  src={memo.imageUrl}
+                  alt=""
+                  className="mt-2 max-h-32 rounded object-contain border border-t-border"
+                />
+              )}
+              <div className="flex gap-3 mt-1.5 text-[10px] text-t-muted flex-wrap">
+                {expSec > 0 && !expired && <span>EXP: {fmt(expSec)}</span>}
+                {memo.activateAt > now && <span>ACTIVE: {fmt(memo.activateAt)}</span>}
+              </div>
+            </>
           )}
-          {memo.content && memo.content.length > 120 && (
-            <button onClick={() => setExpanded(e => !e)} className="text-[10px] text-t-muted hover:text-t-dim">
-              {expanded ? '▲ COLLAPSE' : '▼ EXPAND'}
-            </button>
-          )}
-          {memo.imageUrl && (
-            <img
-              src={memo.imageUrl}
-              alt=""
-              className="mt-2 max-h-32 rounded object-contain border border-t-border"
-            />
-          )}
-          <div className="flex gap-3 mt-1.5 text-[10px] text-t-muted flex-wrap">
-            {expSec > 0 && !expired && (
-              <span>EXP: {fmt(expSec)}</span>
-            )}
-            {memo.activateAt > now && (
-              <span>ACTIVE: {fmt(memo.activateAt)}</span>
-            )}
-          </div>
         </div>
 
-        <Btn variant="danger" onClick={() => onDelete(memo.id)}>✕</Btn>
+        {!editing && (
+          <div className="flex gap-1 shrink-0">
+            <Btn onClick={() => setEditing(true)}>✎</Btn>
+            <Btn variant="danger" onClick={() => onDelete(memo.id)}>✕</Btn>
+          </div>
+        )}
       </div>
     </div>
   )
 }
 
 // ── Schedule Row ──────────────────────────────────────────────────────────────
-function ScheduleRow({ sched, onToggle, onDone, onDelete }: {
+function ScheduleRow({ sched, onToggle, onDone, onDelete, onUpdate }: {
   sched:    Schedule
   onToggle: (id: string) => void
   onDone:   (id: string) => void
   onDelete: (id: string) => void
+  onUpdate: (id: string, patch: object) => Promise<void>
 }) {
+  const [editing,  setEditing]  = useState(false)
+  const [eLabel,   setELabel]   = useState(sched.label)
+  const [eCron,    setECron]    = useState(sched.cron)
+  const [eAt,      setEAt]      = useState(() => toLocalInput(sched.scheduledAt ?? 0))
+  const [eNote,    setENote]    = useState(sched.note)
+  const [saving,   setSaving]   = useState(false)
+
   const now     = Date.now() / 1000
   const overdue = sched.type === 'onetime' && !sched.isDone && sched.isActive
                   && (sched.scheduledAt ?? 0) < now
+
+  const saveEdit = async () => {
+    setSaving(true)
+    const patch: Record<string, unknown> = {
+      label: eLabel.trim() || sched.label,
+      note:  eNote,
+    }
+    if (sched.type === 'recurring') patch.cron         = eCron
+    else                            patch.scheduled_at = fromLocalInput(eAt)
+    await onUpdate(sched.id, patch)
+    setSaving(false)
+    setEditing(false)
+  }
+
   return (
-    <div className={`border border-t-border/60 p-3 flex items-start gap-3 text-xs
+    <div className={`border border-t-border/60 p-3 text-xs
                      ${sched.isDone ? 'opacity-40' : ''} ${overdue ? 'border-t-red/60' : ''}`}>
-      {/* Done checkbox for one-time */}
-      {sched.type === 'onetime' && (
-        <button
-          onClick={() => onDone(sched.id)}
-          className={`w-4 h-4 mt-0.5 shrink-0 border flex items-center justify-center transition-colors
-            ${sched.isDone ? 'border-t-green bg-t-green/20 text-t-green' : 'border-t-border hover:border-t-green'}`}
-        >
-          {sched.isDone && <span className="text-[10px]">✓</span>}
-        </button>
-      )}
-
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className={`font-semibold ${sched.isDone ? 'line-through text-t-muted' : 'text-t-text'}`}>
-            {sched.label}
-          </span>
-          <span className={`text-[10px] border px-1 ${
-            sched.type === 'recurring' ? 'border-cyan-800 text-cyan-400' : 'border-purple-800 text-purple-400'
-          }`}>
-            {sched.type.toUpperCase()}
-          </span>
-          {overdue && <span className="text-[10px] text-t-red border border-t-red/60 px-1">OVERDUE</span>}
+      {editing ? (
+        <div className="space-y-2">
+          <Input value={eLabel} onChange={e => setELabel(e.target.value)} placeholder="Label..." />
+          {sched.type === 'recurring' ? (
+            <div className="space-y-1">
+              <Input
+                label="CRON"
+                value={eCron}
+                onChange={e => setECron(e.target.value)}
+                placeholder="0 9 * * *"
+              />
+              {eCron.trim().split(/\s+/).length === 5 && (
+                <p className="text-[10px] text-t-dim pl-1">{cronDesc(eCron)}</p>
+              )}
+            </div>
+          ) : (
+            <Input
+              label="DATE / TIME"
+              type="datetime-local"
+              value={eAt}
+              onChange={e => setEAt(e.target.value)}
+            />
+          )}
+          <Textarea value={eNote} onChange={e => setENote(e.target.value)} placeholder="Note..." />
+          <div className="flex gap-2">
+            <Btn variant="success" onClick={saveEdit} disabled={saving}>
+              {saving ? 'SAVING...' : 'SAVE'}
+            </Btn>
+            <Btn onClick={() => setEditing(false)}>CANCEL</Btn>
+          </div>
         </div>
-        {sched.type === 'recurring' && sched.cron && (
-          <p className="text-t-dim text-[11px] mt-0.5">
-            <span className="font-mono text-t-muted">{sched.cron}</span>
-            <span className="ml-2 text-t-dim">— {cronDesc(sched.cron)}</span>
-          </p>
-        )}
-        {sched.type === 'onetime' && sched.scheduledAt && (
-          <p className="text-t-dim text-[11px] mt-0.5">{fmt(sched.scheduledAt)}</p>
-        )}
-        {sched.note && <p className="text-[10px] text-t-muted mt-0.5 truncate">{sched.note}</p>}
-      </div>
+      ) : (
+        <div className="flex items-start gap-3">
+          {/* Done checkbox for one-time */}
+          {sched.type === 'onetime' && (
+            <button
+              onClick={() => onDone(sched.id)}
+              className={`w-4 h-4 mt-0.5 shrink-0 border flex items-center justify-center transition-colors
+                ${sched.isDone ? 'border-t-green bg-t-green/20 text-t-green' : 'border-t-border hover:border-t-green'}`}
+            >
+              {sched.isDone && <span className="text-[10px]">✓</span>}
+            </button>
+          )}
 
-      <div className="flex items-center gap-1.5 shrink-0">
-        {sched.type === 'recurring' && (
-          <button
-            onClick={() => onToggle(sched.id)}
-            className={`text-[10px] border px-2 py-0.5 transition-colors ${
-              sched.isActive
-                ? 'border-t-green text-t-green hover:border-t-border hover:text-t-dim'
-                : 'border-t-border text-t-muted hover:border-t-green hover:text-t-green'
-            }`}
-          >
-            {sched.isActive ? 'ON' : 'OFF'}
-          </button>
-        )}
-        <Btn variant="danger" onClick={() => onDelete(sched.id)}>✕</Btn>
-      </div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className={`font-semibold ${sched.isDone ? 'line-through text-t-muted' : 'text-t-text'}`}>
+                {sched.label}
+              </span>
+              <span className={`text-[10px] border px-1 ${
+                sched.type === 'recurring' ? 'border-cyan-800 text-cyan-400' : 'border-purple-800 text-purple-400'
+              }`}>
+                {sched.type.toUpperCase()}
+              </span>
+              {overdue && <span className="text-[10px] text-t-red border border-t-red/60 px-1">OVERDUE</span>}
+            </div>
+            {sched.type === 'recurring' && sched.cron && (
+              <p className="text-t-dim text-[11px] mt-0.5">
+                <span className="font-mono text-t-muted">{sched.cron}</span>
+                <span className="ml-2 text-t-dim">— {cronDesc(sched.cron)}</span>
+              </p>
+            )}
+            {sched.type === 'onetime' && sched.scheduledAt && (
+              <p className="text-t-dim text-[11px] mt-0.5">{fmt(sched.scheduledAt)}</p>
+            )}
+            {sched.note && <p className="text-[10px] text-t-muted mt-0.5 truncate">{sched.note}</p>}
+          </div>
+
+          <div className="flex items-center gap-1.5 shrink-0">
+            {sched.type === 'recurring' && (
+              <button
+                onClick={() => onToggle(sched.id)}
+                className={`text-[10px] border px-2 py-0.5 transition-colors ${
+                  sched.isActive
+                    ? 'border-t-green text-t-green hover:border-t-border hover:text-t-dim'
+                    : 'border-t-border text-t-muted hover:border-t-green hover:text-t-green'
+                }`}
+              >
+                {sched.isActive ? 'ON' : 'OFF'}
+              </button>
+            )}
+            <Btn onClick={() => setEditing(true)}>✎</Btn>
+            <Btn variant="danger" onClick={() => onDelete(sched.id)}>✕</Btn>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -352,11 +482,13 @@ function ScheduleRow({ sched, onToggle, onDone, onDelete }: {
 export default function Planner() {
   const sessionId = SESSION()
 
-  const [tab,       setTab]       = useState<PlannerTab>('memos')
-  const [memos,     setMemos]     = useState<Memo[]>([])
-  const [schedules, setSchedules] = useState<Schedule[]>([])
-  const [alerts,    setAlerts]    = useState<Alert[]>([])
-  const [loading,   setLoading]   = useState(true)
+  const [tab,           setTab]          = useState<PlannerTab>('memos')
+  const [memos,         setMemos]         = useState<Memo[]>([])
+  const [schedules,     setSchedules]     = useState<Schedule[]>([])
+  const [alerts,        setAlerts]        = useState<Alert[]>([])
+  const [notifications, setNotifications] = useState<FiredNotification[]>([])
+  const [loading,       setLoading]       = useState(true)
+  const prevNotifCount = useRef(0)
 
   // Memo form state
   const [mTitle,     setMTitle]    = useState('')
@@ -383,10 +515,11 @@ export default function Planner() {
   const loadAll = useCallback(async () => {
     if (!sessionId) { setLoading(false); return }
     try {
-      const [mr, sr, ar] = await Promise.all([
+      const [mr, sr, ar, nr] = await Promise.all([
         fetch(`${API}/memos?session_id=${sessionId}`),
         fetch(`${API}/schedules?session_id=${sessionId}`),
         fetch(`${API}/alerts?session_id=${sessionId}`),
+        fetch(`${API}/notifications?session_id=${sessionId}`),
       ])
       if (mr.ok) setMemos((await mr.json() as { memos: Memo[] }).memos)
       if (sr.ok) setSchedules((await sr.json() as { schedules: Schedule[] }).schedules)
@@ -394,11 +527,21 @@ export default function Planner() {
         const alertData = await ar.json() as { alerts: Alert[]; count: number }
         setAlerts(alertData.alerts)
         setAlertBadge(alertData.count)
-        // Browser notification if new alerts arrived
         if (alertData.count > prevAlertCount.current && prevAlertCount.current > 0) {
           sendNotif('PLANNER ALERT', `${alertData.count} item(s) need attention`)
         }
         prevAlertCount.current = alertData.count
+      }
+      if (nr.ok) {
+        const nData = await nr.json() as { notifications: FiredNotification[] }
+        const incoming = nData.notifications
+        // Browser notification for newly fired events
+        if (incoming.length > prevNotifCount.current && prevNotifCount.current > 0) {
+          const newest = incoming[0]
+          sendNotif('SCHEDULE FIRED', newest?.label ?? 'Recurring schedule triggered')
+        }
+        prevNotifCount.current = incoming.length
+        setNotifications(incoming)
       }
     } finally {
       setLoading(false)
@@ -455,6 +598,15 @@ export default function Planner() {
     setMemos(prev => prev.filter(m => m.id !== id))
   }
 
+  const updateMemo = async (id: string, patch: object) => {
+    const res = await fetch(`${API}/memos/${id}?session_id=${sessionId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    })
+    if (res.ok) await loadAll()
+  }
+
   // ── Schedule actions ──────────────────────────────────────────────────────
   const createSchedule = async () => {
     if (!sLabel.trim()) { setSError('Label required'); return }
@@ -503,6 +655,25 @@ export default function Planner() {
   const deleteSched = async (id: string) => {
     await fetch(`${API}/schedules/${id}?session_id=${sessionId}`, { method: 'DELETE' })
     setSchedules(prev => prev.filter(s => s.id !== id))
+  }
+
+  const updateSched = async (id: string, patch: object) => {
+    const res = await fetch(`${API}/schedules/${id}?session_id=${sessionId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    })
+    if (res.ok) await loadAll()
+  }
+
+  const ackNotif = async (id: string) => {
+    await fetch(`${API}/notifications/${id}/ack?session_id=${sessionId}`, { method: 'PATCH' })
+    setNotifications(prev => prev.filter(n => n.id !== id))
+  }
+
+  const ackAllNotifs = async () => {
+    await fetch(`${API}/notifications/ack-all?session_id=${sessionId}`, { method: 'DELETE' })
+    setNotifications([])
   }
 
   // ── No session guard ──────────────────────────────────────────────────────
@@ -570,7 +741,7 @@ export default function Planner() {
             ].join(' ')}
           >
             {t.toUpperCase()}
-            {t === 'alerts' && alerts.length > 0 && (
+            {t === 'alerts' && (alerts.length > 0 || notifications.length > 0) && (
               <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-t-red animate-glow-pulse" />
             )}
           </button>
@@ -618,7 +789,7 @@ export default function Planner() {
           ) : (
             <div className="space-y-2">
               {memos.map(m => (
-                <MemoCard key={m.id} memo={m} onToggle={toggleMemo} onDelete={deleteMemo} />
+                <MemoCard key={m.id} memo={m} onToggle={toggleMemo} onDelete={deleteMemo} onUpdate={updateMemo} />
               ))}
             </div>
           )}
@@ -697,7 +868,7 @@ export default function Planner() {
             <div className="space-y-1">
               <p className="text-[10px] text-t-dim tracking-widest px-1">RECURRING</p>
               {recurring.map(s => (
-                <ScheduleRow key={s.id} sched={s} onToggle={toggleSched} onDone={doneSched} onDelete={deleteSched} />
+                <ScheduleRow key={s.id} sched={s} onToggle={toggleSched} onDone={doneSched} onDelete={deleteSched} onUpdate={updateSched} />
               ))}
             </div>
           )}
@@ -709,7 +880,7 @@ export default function Planner() {
               {onetime
                 .sort((a, b) => (a.scheduledAt ?? 0) - (b.scheduledAt ?? 0))
                 .map(s => (
-                  <ScheduleRow key={s.id} sched={s} onToggle={toggleSched} onDone={doneSched} onDelete={deleteSched} />
+                  <ScheduleRow key={s.id} sched={s} onToggle={toggleSched} onDone={doneSched} onDelete={deleteSched} onUpdate={updateSched} />
                 ))}
             </div>
           )}
@@ -722,21 +893,46 @@ export default function Planner() {
       ) : (
 
         /* ── ALERTS ─────────────────────────────────────────────── */
-        <div className="flex-1 overflow-auto p-4 space-y-3">
-          <div className="flex items-center justify-between">
+        <div className="flex-1 overflow-auto p-4 space-y-4">
+
+          {/* Fired notifications from APScheduler */}
+          {notifications.length > 0 && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-[10px] text-cyan-400 tracking-widest font-semibold">
+                  FIRED NOTIFICATIONS ({notifications.length})
+                </p>
+                <Btn onClick={ackAllNotifs}>ACK ALL</Btn>
+              </div>
+              {notifications.map(n => (
+                <div key={n.id} className="border border-cyan-800/60 bg-cyan-900/10 p-3 flex items-start gap-3">
+                  <div className="flex-1 min-w-0 space-y-0.5">
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="text-[10px] border border-cyan-800 text-cyan-400 px-1">FIRED</span>
+                      <span className="text-t-text font-semibold">{n.label}</span>
+                    </div>
+                    <p className="text-[10px] text-t-muted">
+                      {new Date(n.firedAt * 1000).toLocaleString()}
+                    </p>
+                  </div>
+                  <Btn onClick={() => ackNotif(n.id)}>ACK</Btn>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Overdue / expiring alerts */}
+          <div className="space-y-2">
             <p className="text-[10px] text-t-dim tracking-widest">
               {alerts.length} ACTIVE ALERT{alerts.length !== 1 ? 'S' : ''} · AUTO-REFRESH 30s
             </p>
-          </div>
-
-          {alerts.length === 0 ? (
-            <div className="text-center py-12 space-y-2">
-              <p className="text-t-green text-sm">ALL CLEAR</p>
-              <p className="text-xs text-t-muted">No overdue tasks or expiring memos.</p>
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {alerts.map((a, i) => (
+            {alerts.length === 0 && notifications.length === 0 ? (
+              <div className="text-center py-12 space-y-2">
+                <p className="text-t-green text-sm">ALL CLEAR</p>
+                <p className="text-xs text-t-muted">No overdue tasks or expiring memos.</p>
+              </div>
+            ) : (
+              alerts.map((a, i) => (
                 <div
                   key={i}
                   className={`border p-3 space-y-1 ${
@@ -767,9 +963,9 @@ export default function Planner() {
                   )}
                   {a.note && <p className="text-[10px] text-t-muted">{a.note}</p>}
                 </div>
-              ))}
-            </div>
-          )}
+              ))
+            )}
+          </div>
         </div>
       )}
     </div>

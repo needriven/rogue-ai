@@ -43,6 +43,13 @@ interface MonitorData {
   mongodb:    MongoInfo
 }
 
+interface HistorySample {
+  ts:   number
+  cpu:  number
+  mem:  number
+  disk: number
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 function formatUptime(sec: number): string {
   const d = Math.floor(sec / 86400)
@@ -66,23 +73,60 @@ function pctBarColor(pct: number): string {
 }
 
 function containerStatusColor(status: string): string {
-  if (status.toLowerCase().startsWith('up')) return 'text-t-green'
-  if (status.toLowerCase().includes('exit')) return 'text-t-red'
+  if (status.toLowerCase().startsWith('up'))      return 'text-t-green'
+  if (status.toLowerCase().includes('exit'))      return 'text-t-red'
   return 'text-t-amber'
 }
 
 function containerDot(status: string): string {
-  if (status.toLowerCase().startsWith('up')) return 'bg-t-green animate-glow-pulse'
-  if (status.toLowerCase().includes('exit')) return 'bg-t-red'
+  if (status.toLowerCase().startsWith('up'))      return 'bg-t-green animate-glow-pulse'
+  if (status.toLowerCase().includes('exit'))      return 'bg-t-red'
   return 'bg-t-amber'
 }
 
-// ── Gauge bar ──────────────────────────────────────────────────────────────────
-function GaugeBar({ label, value, pct, unit = '%' }: {
-  label: string
-  value: string | number
-  pct:   number
-  unit?: string
+// ── Sparkline ─────────────────────────────────────────────────────────────────
+function Sparkline({ data, field, color }: {
+  data:  HistorySample[]
+  field: 'cpu' | 'mem' | 'disk'
+  color: string
+}) {
+  if (data.length < 2) return (
+    <div className="h-8 flex items-end gap-px opacity-30">
+      {Array.from({ length: 20 }).map((_, i) => (
+        <div key={i} className="flex-1 bg-t-border" style={{ height: '2px' }} />
+      ))}
+    </div>
+  )
+
+  const vals    = data.map(s => s[field])
+  const max     = Math.max(...vals, 1)
+  const display = data.slice(-40)   // last 40 samples = ~20 min
+
+  return (
+    <div className="h-8 flex items-end gap-px" title={`${field.toUpperCase()} history`}>
+      {display.map((s, i) => {
+        const h = Math.max(1, Math.round((s[field] / max) * 32))
+        return (
+          <div
+            key={i}
+            className={`flex-1 ${color} opacity-70 transition-all duration-300`}
+            style={{ height: `${h}px` }}
+            title={`${s[field]}% @ ${new Date(s.ts * 1000).toLocaleTimeString()}`}
+          />
+        )
+      })}
+    </div>
+  )
+}
+
+// ── Gauge bar ─────────────────────────────────────────────────────────────────
+function GaugeBar({ label, value, pct, unit = '%', history, field }: {
+  label:    string
+  value:    string | number
+  pct:      number
+  unit?:    string
+  history?: HistorySample[]
+  field?:   'cpu' | 'mem' | 'disk'
 }) {
   return (
     <div className="space-y-1">
@@ -96,6 +140,9 @@ function GaugeBar({ label, value, pct, unit = '%' }: {
           style={{ width: `${Math.min(100, pct)}%` }}
         />
       </div>
+      {history && field && history.length > 1 && (
+        <Sparkline data={history} field={field} color={pctBarColor(pct)} />
+      )}
     </div>
   )
 }
@@ -123,16 +170,17 @@ function Stat({ label, value, dim }: { label: string; value: string | number; di
 // ── Main component ─────────────────────────────────────────────────────────────
 export default function Monitor() {
   const [data,      setData]    = useState<MonitorData | null>(null)
+  const [history,   setHistory] = useState<HistorySample[]>([])
   const [error,     setError]   = useState<string | null>(null)
   const [loading,   setLoading] = useState(true)
   const [lastUpdate,setLast]    = useState<number>(0)
+  const [ageSec,    setAgeSec]  = useState<number | null>(null)
 
-  const fetch_stats = useCallback(async () => {
+  const fetchStats = useCallback(async () => {
     try {
       const res = await fetch(`${API}/stats`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const json = await res.json() as MonitorData
-      setData(json)
+      setData(await res.json() as MonitorData)
       setLast(Date.now())
       setError(null)
     } catch (e) {
@@ -142,13 +190,28 @@ export default function Monitor() {
     }
   }, [])
 
-  useEffect(() => {
-    void fetch_stats()
-    const id = setInterval(fetch_stats, 5_000)
-    return () => clearInterval(id)
-  }, [fetch_stats])
+  const fetchHistory = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/history`)
+      if (res.ok) setHistory((await res.json() as { history: HistorySample[] }).history)
+    } catch { /* silent */ }
+  }, [])
 
-  const ageSec = lastUpdate ? Math.floor((Date.now() - lastUpdate) / 1000) : null
+  useEffect(() => {
+    void fetchStats()
+    void fetchHistory()
+    const statsId   = setInterval(fetchStats,   5_000)
+    const historyId = setInterval(fetchHistory, 30_000)
+    return () => { clearInterval(statsId); clearInterval(historyId) }
+  }, [fetchStats, fetchHistory])
+
+  // Age counter
+  useEffect(() => {
+    const id = setInterval(() => {
+      setAgeSec(lastUpdate ? Math.floor((Date.now() - lastUpdate) / 1000) : null)
+    }, 1000)
+    return () => clearInterval(id)
+  }, [lastUpdate])
 
   return (
     <div className="h-full flex flex-col font-mono text-t-text overflow-hidden">
@@ -164,10 +227,14 @@ export default function Monitor() {
         <div className="flex items-center gap-4 text-xs text-t-dim">
           {ageSec !== null && (
             <span>
-              REFRESH <span className={ageSec < 3 ? 'text-t-green' : ageSec < 8 ? 'text-t-amber' : 'text-t-red'}>
+              REFRESH{' '}
+              <span className={ageSec < 3 ? 'text-t-green' : ageSec < 8 ? 'text-t-amber' : 'text-t-red'}>
                 {ageSec}s
-              </span> AGO
+              </span>{' '}AGO
             </span>
+          )}
+          {history.length > 0 && (
+            <span className="text-t-muted">HIST: {history.length} samples</span>
           )}
           <span className="text-t-muted">AUTO ×5s</span>
           {error && <span className="text-t-red">ERR: {error}</span>}
@@ -186,42 +253,48 @@ export default function Monitor() {
       ) : (
         <div className="flex-1 overflow-auto p-6 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 content-start">
 
-          {/* System Resources */}
+          {/* System Resources + sparklines */}
           <Card title="SYSTEM RESOURCES">
             <GaugeBar
               label="CPU"
               value={`${data.system.cpu_percent}%`}
               pct={data.system.cpu_percent}
               unit=""
+              history={history}
+              field="cpu"
             />
             <GaugeBar
               label="MEMORY"
               value={`${data.system.mem_percent}%`}
               pct={data.system.mem_percent}
               unit=""
+              history={history}
+              field="mem"
             />
             <GaugeBar
               label="DISK"
               value={`${data.system.disk_percent}%`}
               pct={data.system.disk_percent}
               unit=""
+              history={history}
+              field="disk"
             />
             <div className="pt-2 space-y-1 border-t border-t-border">
-              <Stat
-                label="MEM USED"
-                value={`${(data.system.mem_used_kb / 1024).toFixed(0)} / ${(data.system.mem_total_kb / 1024).toFixed(0)} MB`}
-              />
-              <Stat
-                label="DISK USED"
-                value={`${data.system.disk_used_gb} / ${data.system.disk_total_gb} GB`}
-              />
+              <Stat label="MEM USED" value={`${(data.system.mem_used_kb / 1024).toFixed(0)} / ${(data.system.mem_total_kb / 1024).toFixed(0)} MB`} />
+              <Stat label="DISK USED" value={`${data.system.disk_used_gb} / ${data.system.disk_total_gb} GB`} />
+              {history.length > 0 && (
+                <p className="text-[10px] text-t-muted pt-1">↑ 30-min history (30s interval)</p>
+              )}
             </div>
           </Card>
 
           {/* Docker Containers */}
           <Card title="DOCKER CONTAINERS">
             {data.containers.length === 0 ? (
-              <p className="text-xs text-t-dim">No containers found</p>
+              <div className="space-y-1">
+                <p className="text-xs text-t-amber">Socket connecting...</p>
+                <p className="text-[10px] text-t-muted">docker.sock mounted — data available shortly</p>
+              </div>
             ) : (
               <div className="space-y-2">
                 {data.containers.map((c, i) => (
@@ -234,7 +307,7 @@ export default function Monitor() {
                           {c.status.slice(0, 20)}
                         </span>
                       </div>
-                      <div className="text-t-muted truncate">{c.image}</div>
+                      <div className="text-t-muted truncate text-[10px]">{c.image}</div>
                     </div>
                   </div>
                 ))}
@@ -248,18 +321,14 @@ export default function Monitor() {
               <p className="text-xs text-t-red">Redis unreachable</p>
             ) : (
               <>
-                <Stat label="MEMORY"        value={data.redis.used_memory_human} />
-                <Stat label="CLIENTS"       value={data.redis.connected_clients} />
-                <Stat label="UPTIME"        value={formatUptime(data.redis.uptime_in_seconds)} />
+                <Stat label="MEMORY"  value={data.redis.used_memory_human} />
+                <Stat label="CLIENTS" value={data.redis.connected_clients} />
+                <Stat label="UPTIME"  value={formatUptime(data.redis.uptime_in_seconds)} />
                 <div className="border-t border-t-border pt-2 space-y-1">
-                  <p className="text-xs text-t-dim tracking-wider">KEYSPACE</p>
+                  <p className="text-[10px] text-t-dim tracking-wider">KEYSPACE</p>
                   <div className="flex gap-4 text-xs">
-                    <span>
-                      HITS <span className="text-t-green tabular-nums">{data.redis.keyspace_hits.toLocaleString()}</span>
-                    </span>
-                    <span>
-                      MISS <span className="text-t-amber tabular-nums">{data.redis.keyspace_misses.toLocaleString()}</span>
-                    </span>
+                    <span>HITS <span className="text-t-green tabular-nums">{data.redis.keyspace_hits.toLocaleString()}</span></span>
+                    <span>MISS <span className="text-t-amber tabular-nums">{data.redis.keyspace_misses.toLocaleString()}</span></span>
                   </div>
                   <Stat
                     label="HIT RATE"
@@ -269,11 +338,7 @@ export default function Monitor() {
                         : 'N/A'
                     }
                   />
-                  <Stat
-                    label="TOTAL CMDS"
-                    value={data.redis.total_commands_processed.toLocaleString()}
-                    dim
-                  />
+                  <Stat label="TOTAL CMDS" value={data.redis.total_commands_processed.toLocaleString()} dim />
                 </div>
               </>
             )}
@@ -289,7 +354,7 @@ export default function Monitor() {
                 <Stat label="CONNECTIONS" value={`${data.mongodb.connections_current} / ${data.mongodb.connections_current + data.mongodb.connections_available}`} />
                 {data.mongodb.opcounters && (
                   <div className="border-t border-t-border pt-2 space-y-1">
-                    <p className="text-xs text-t-dim tracking-wider">OP COUNTERS</p>
+                    <p className="text-[10px] text-t-dim tracking-wider">OP COUNTERS</p>
                     {['insert', 'query', 'update', 'delete'].map(op => (
                       <Stat
                         key={op}
@@ -304,7 +369,7 @@ export default function Monitor() {
             )}
           </Card>
 
-          {/* Data snapshot time */}
+          {/* Snapshot info */}
           <div className="border border-t-border/40 bg-t-panel/30 p-4 text-xs text-t-dim space-y-1">
             <p className="text-t-green/70 tracking-widest font-semibold text-[10px]">SNAPSHOT</p>
             <p>COLLECTED: {new Date(data.ts).toLocaleTimeString()}</p>

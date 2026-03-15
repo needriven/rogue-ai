@@ -404,16 +404,28 @@ async def lifespan(_: FastAPI):
     await db.planner_memos.create_index([("sessionId", 1), ("createdAt", -1)])
     await db.planner_schedules.create_index([("sessionId", 1), ("createdAt", -1)])
 
+    # Warm up CPU baseline so first monitor request shows real delta
+    _total, _idle = _read_cpu_stats()
+    _cpu_prev.update({"total": _total, "idle": _idle, "percent": 0.0})
+
     await init_db()
+    await db.planner_notifications.create_index([("sessionId", 1), ("acked", 1), ("firedAt", -1)])
+    await db.planner_notifications.create_index("firedAt", expireAfterSeconds=86400)  # auto-delete after 24h
+
     scheduler.start()
     await _load_bot_schedules()
-    task = asyncio.create_task(feed_fetcher_loop())
+    await _load_planner_schedules()
+
+    task_feed    = asyncio.create_task(feed_fetcher_loop())
+    task_monitor = asyncio.create_task(monitor_collector_loop())
+    task_cleanup = asyncio.create_task(upload_cleanup_loop())
     yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    task_feed.cancel(); task_monitor.cancel(); task_cleanup.cancel()
+    for t in [task_feed, task_monitor, task_cleanup]:
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
     scheduler.shutdown(wait=False)
     if redis_client:
         await redis_client.aclose()
@@ -2573,3 +2585,299 @@ async def get_alerts(session_id: str = Query(...)):
 
     # Recurring schedules that are active (just list them for awareness)
     return {"alerts": alerts, "count": len(alerts)}
+
+
+# ── Monitor: time-series collector ────────────────────────────────────────────
+async def monitor_collector_loop() -> None:
+    """Background: collect CPU/mem/disk every 30s into Redis List (60 samples = 30min)."""
+    await asyncio.sleep(15)
+    while True:
+        try:
+            r = _get_redis()
+            total, idle = _read_cpu_stats()
+            d_total = total - _cpu_prev["total"]
+            d_idle  = idle  - _cpu_prev["idle"]
+            cpu_pct = max(0.0, min(100.0, (1 - d_idle / max(d_total, 1)) * 100)) if d_total > 0 else _cpu_prev["percent"]
+            _cpu_prev.update({"total": total, "idle": idle, "percent": cpu_pct})
+
+            mem      = _read_mem_info()
+            mem_tot  = mem.get("MemTotal", 0)
+            mem_free = mem.get("MemAvailable", mem.get("MemFree", 0))
+            mem_pct  = ((mem_tot - mem_free) / mem_tot * 100) if mem_tot > 0 else 0.0
+
+            disk_tot, disk_used, _ = _read_disk_usage("/")
+            disk_pct = (disk_used / disk_tot * 100) if disk_tot > 0 else 0.0
+
+            sample = json.dumps({
+                "ts":   int(time.time()),
+                "cpu":  round(cpu_pct, 1),
+                "mem":  round(mem_pct, 1),
+                "disk": round(disk_pct, 1),
+            })
+            pipe = r.pipeline()
+            pipe.lpush("monitor:history", sample)
+            pipe.ltrim("monitor:history", 0, 59)   # 60 × 30s = 30 min
+            await pipe.execute()
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+
+@app.get("/api/monitor/history")
+async def get_monitor_history():
+    r   = _get_redis()
+    raw = await r.lrange("monitor:history", 0, -1)
+    history = []
+    for item in reversed(raw):   # lrange returns newest-first; reverse for chronological
+        try:
+            history.append(json.loads(item))
+        except Exception:
+            pass
+    return {"history": history}
+
+
+# ── Planner: image upload orphan cleanup ──────────────────────────────────────
+async def upload_cleanup_loop() -> None:
+    """Background: every 6h remove /data/uploads/ images not referenced by any memo."""
+    await asyncio.sleep(300)   # wait 5 min after startup
+    while True:
+        try:
+            db = _get_mongo()
+            # Collect all imageUrl values stored in memos
+            docs = await db.planner_memos.find(
+                {"imageUrl": {"$ne": ""}}, {"imageUrl": 1}
+            ).to_list(length=10000)
+            referenced = {d["imageUrl"].split("/uploads/")[-1] for d in docs if d.get("imageUrl", "").startswith("/uploads/")}
+
+            for fname in os.listdir(UPLOADS_DIR):
+                if fname not in referenced:
+                    try:
+                        os.unlink(os.path.join(UPLOADS_DIR, fname))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        await asyncio.sleep(6 * 3600)
+
+
+# ── Planner: APScheduler integration for recurring schedules ──────────────────
+def _register_planner_sched(sched_id: str, session_id: str, label: str, cron: str) -> None:
+    parts = cron.strip().split()
+    if len(parts) != 5:
+        return
+    minute, hour, dom, month, dow = parts
+    try:
+        trigger = CronTrigger(
+            minute=minute, hour=hour, day=dom,
+            month=month, day_of_week=dow, timezone="UTC",
+        )
+        scheduler.add_job(
+            _planner_sched_fire, trigger,
+            id=f"planner_{sched_id}",
+            replace_existing=True,
+            kwargs={"session_id": session_id, "sched_id": sched_id, "label": label},
+        )
+    except Exception:
+        pass
+
+
+def _unregister_planner_sched(sched_id: str) -> None:
+    try:
+        scheduler.remove_job(f"planner_{sched_id}")
+    except Exception:
+        pass
+
+
+async def _planner_sched_fire(session_id: str, sched_id: str, label: str) -> None:
+    """Called by APScheduler when a recurring planner schedule fires."""
+    db = _get_mongo()
+    await db.planner_notifications.insert_one({
+        "sessionId":  session_id,
+        "scheduleId": sched_id,
+        "label":      label,
+        "firedAt":    time.time(),
+        "acked":      False,
+    })
+
+
+async def _load_planner_schedules() -> None:
+    """Register all active recurring planner schedules into APScheduler on startup."""
+    db   = _get_mongo()
+    docs = await db.planner_schedules.find(
+        {"type": "recurring", "isActive": True}
+    ).to_list(length=5000)
+    for doc in docs:
+        _register_planner_sched(
+            str(doc["_id"]), doc["sessionId"], doc["label"], doc["cron"]
+        )
+
+
+# ── Planner: new REST endpoints ────────────────────────────────────────────────
+
+class MemoUpdate(BaseModel):
+    title:       Optional[str]   = None
+    content:     Optional[str]   = None
+    activate_at: Optional[float] = None
+    expires_at:  Optional[float] = None
+
+
+@app.patch("/api/planner/memos/{memo_id}")
+async def update_memo(memo_id: str, body: MemoUpdate, session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    from bson import ObjectId
+    try:
+        oid = ObjectId(memo_id)
+    except Exception:
+        raise HTTPException(400, "Invalid memo_id")
+
+    db  = _get_mongo()
+    now = time.time()
+    upd: dict = {}
+    if body.title       is not None: upd["title"]      = body.title[:200]
+    if body.content     is not None: upd["content"]    = body.content[:4000]
+    if body.activate_at is not None: upd["activateAt"] = body.activate_at or now
+    if body.expires_at  is not None:
+        if body.expires_at > now:
+            from datetime import datetime, timezone
+            upd["expiresAt"] = datetime.fromtimestamp(body.expires_at, tz=timezone.utc)
+        else:
+            upd["$unset"] = {"expiresAt": ""}
+
+    if not upd:
+        return {"ok": True}
+
+    # Separate $unset if present
+    set_fields = {k: v for k, v in upd.items() if k != "$unset"}
+    mongo_op: dict = {}
+    if set_fields:        mongo_op["$set"]   = set_fields
+    if "$unset" in upd:   mongo_op["$unset"] = upd["$unset"]
+
+    result = await db.planner_memos.update_one(
+        {"_id": oid, "sessionId": session_id}, mongo_op
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Memo not found")
+    return {"ok": True}
+
+
+class ScheduleUpdate(BaseModel):
+    label:        Optional[str]   = None
+    cron:         Optional[str]   = None
+    scheduled_at: Optional[float] = None
+    note:         Optional[str]   = None
+    is_active:    Optional[bool]  = None
+
+
+@app.patch("/api/planner/schedules/{sched_id}")
+async def update_schedule(sched_id: str, body: ScheduleUpdate, session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    from bson import ObjectId
+    try:
+        oid = ObjectId(sched_id)
+    except Exception:
+        raise HTTPException(400, "Invalid sched_id")
+
+    db  = _get_mongo()
+    doc = await db.planner_schedules.find_one({"_id": oid, "sessionId": session_id})
+    if not doc:
+        raise HTTPException(404, "Schedule not found")
+
+    upd: dict = {}
+    if body.label        is not None: upd["label"]       = body.label[:200]
+    if body.note         is not None: upd["note"]        = body.note[:1000]
+    if body.is_active    is not None: upd["isActive"]    = body.is_active
+    if body.scheduled_at is not None: upd["scheduledAt"] = body.scheduled_at
+    if body.cron         is not None:
+        parts = body.cron.strip().split()
+        if len(parts) != 5:
+            raise HTTPException(400, "cron must have 5 fields")
+        upd["cron"] = body.cron.strip()
+
+    if upd:
+        await db.planner_schedules.update_one({"_id": oid}, {"$set": upd})
+
+    # Update APScheduler if cron or isActive changed for recurring schedules
+    if doc.get("type") == "recurring":
+        new_cron     = upd.get("cron",     doc.get("cron", ""))
+        new_active   = upd.get("isActive", doc.get("isActive", True))
+        new_label    = upd.get("label",    doc.get("label", ""))
+        if new_active:
+            _register_planner_sched(sched_id, session_id, new_label, new_cron)
+        else:
+            _unregister_planner_sched(sched_id)
+
+    return {"ok": True}
+
+
+# ── Planner: notifications (APScheduler-fired alerts) ─────────────────────────
+@app.get("/api/planner/notifications")
+async def get_notifications(session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    db   = _get_mongo()
+    docs = await db.planner_notifications.find(
+        {"sessionId": session_id, "acked": False},
+        sort=[("firedAt", -1)],
+        limit=20,
+    ).to_list(length=20)
+
+    out = []
+    for d in docs:
+        out.append({
+            "id":         str(d["_id"]),
+            "scheduleId": d.get("scheduleId", ""),
+            "label":      d.get("label", ""),
+            "firedAt":    d.get("firedAt", 0),
+        })
+    return {"notifications": out}
+
+
+@app.patch("/api/planner/notifications/{notif_id}/ack")
+async def ack_notification(notif_id: str, session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    from bson import ObjectId
+    try:
+        oid = ObjectId(notif_id)
+    except Exception:
+        raise HTTPException(400, "Invalid notif_id")
+
+    db = _get_mongo()
+    await db.planner_notifications.update_one(
+        {"_id": oid, "sessionId": session_id}, {"$set": {"acked": True}}
+    )
+    return {"ok": True}
+
+
+@app.delete("/api/planner/notifications/ack-all")
+async def ack_all_notifications(session_id: str = Query(...)):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+    db = _get_mongo()
+    await db.planner_notifications.update_many(
+        {"sessionId": session_id, "acked": False},
+        {"$set": {"acked": True}},
+    )
+    return {"ok": True}
+
+
+# ── Analytics: stage distribution (add to summary endpoint) ───────────────────
+@app.get("/api/analytics/stage-dist/{session_id}")
+async def get_stage_dist(session_id: str):
+    if not _valid_session(session_id):
+        raise HTTPException(400, "Invalid session_id")
+
+    db = _get_mongo()
+    pipeline = [
+        {"$match": {"session_id": session_id}},
+        {"$group": {"_id": "$stage_reached", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+    ]
+    docs = await db.run_records.aggregate(pipeline).to_list(length=10)
+    return {"stages": [{"stage": d["_id"], "count": d["count"]} for d in docs]}
