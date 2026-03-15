@@ -34,6 +34,7 @@ const NAV_GROUPS: NavGroup[] = [
     id:    'services',
     label: 'SERVICES',
     items: [
+      { to: '/digest',  label: 'DIGEST',  icon: '✦', exact: false },
       { to: '/feed',    label: 'FEED',    icon: '◈', exact: false },
       { to: '/monitor', label: 'MONITOR', icon: '◎', exact: false },
       { to: '/planner', label: 'PLANNER', icon: '◷', exact: false },

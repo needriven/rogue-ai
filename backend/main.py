@@ -229,7 +229,27 @@ async def feed_fetcher_loop() -> None:
 
 
 # ── Settings helpers ──────────────────────────────────────────────────────────
+
+# Env-var overrides: env key → setting key
+_ENV_OVERRIDES: dict[str, str] = {
+    "ANTHROPIC_API_KEY": "anthropic_api_key",
+    "GITHUB_TOKEN":      "github_token",
+    "GITHUB_USERNAME":   "github_username",
+    "GITHUB_REPO":       "github_repo",
+    "SLACK_WEBHOOK":     "slack_webhook",
+    "DISCORD_WEBHOOK":   "discord_webhook",
+}
+# Reverse map: setting key → env var name
+_SETTING_ENV: dict[str, str] = {v: k for k, v in _ENV_OVERRIDES.items()}
+
+
 async def get_setting(key: str) -> str:
+    """Return setting value. Env vars take precedence over DB values."""
+    env_key = _SETTING_ENV.get(key)
+    if env_key:
+        env_val = os.environ.get(env_key, "")
+        if env_val:
+            return env_val
     async with aiosqlite.connect(DATABASE_PATH) as db:
         async with db.execute("SELECT value FROM app_settings WHERE key=?", (key,)) as cur:
             row = await cur.fetchone()
@@ -412,9 +432,17 @@ async def lifespan(_: FastAPI):
     await db.planner_notifications.create_index([("sessionId", 1), ("acked", 1), ("firedAt", -1)])
     await db.planner_notifications.create_index("firedAt", expireAfterSeconds=86400)  # auto-delete after 24h
 
+    # Digest indexes
+    await db.digest_runs.create_index([("createdAt", -1)])
+    await db.digest_runs.create_index("status")
+    await db.digest_items.create_index([("runId", 1), ("aiImportance", -1)])
+    await db.digest_items.create_index([("runId", 1), ("score", -1)])
+    await db.digest_model_feedback.create_index([("runId", 1)])
+
     scheduler.start()
     await _load_bot_schedules()
     await _load_planner_schedules()
+    await _load_digest_schedule()
 
     task_feed    = asyncio.create_task(feed_fetcher_loop())
     task_monitor = asyncio.create_task(monitor_collector_loop())
@@ -435,9 +463,29 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Rogue AI API", version="1.0.0", lifespan=lifespan)
 
+# ── Simple in-memory rate limiter for AI/cost endpoints ───────────────────────
+_rate_windows: dict[str, list[float]] = {}
+
+def _rate_limit(key: str, max_calls: int, window_secs: int, request: Request) -> None:
+    """Raise 429 if `key` has been called more than max_calls in the last window_secs."""
+    client_ip = request.headers.get("CF-Connecting-IP") or request.client.host or "unknown"
+    bucket    = f"{key}:{client_ip}"
+    now       = time.time()
+    calls     = _rate_windows.get(bucket, [])
+    calls     = [t for t in calls if now - t < window_secs]
+    if len(calls) >= max_calls:
+        raise HTTPException(429, "Rate limit exceeded — try again later")
+    calls.append(now)
+    _rate_windows[bucket] = calls
+
+_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
+    "ALLOWED_ORIGINS",
+    "https://chans.place,http://localhost:5173,http://localhost:4173",
+).split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_methods=["GET", "PUT", "POST", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
@@ -827,13 +875,16 @@ class SettingPayload(BaseModel):
 async def list_settings():
     result = []
     for key in ALL_SETTING_KEYS:
-        value  = await get_setting(key)
-        masked = key in MASKED_SETTING_KEYS
+        env_key   = _SETTING_ENV.get(key)
+        from_env  = bool(env_key and os.environ.get(env_key, ""))
+        value     = await get_setting(key)
+        masked    = key in MASKED_SETTING_KEYS
         result.append({
-            "key":     key,
-            "is_set":  bool(value),
-            "display": _mask_value(value) if masked else value,
-            "masked":  masked,
+            "key":      key,
+            "is_set":   bool(value),
+            "display":  _mask_value(value) if masked else value,
+            "masked":   masked,
+            "from_env": from_env,   # UI can show lock icon / disable edit
         })
     return result
 
@@ -842,6 +893,9 @@ async def list_settings():
 async def update_setting(key: str, payload: SettingPayload):
     if key not in ALL_SETTING_KEYS:
         raise HTTPException(400, f"Unknown setting key: {key}")
+    env_key = _SETTING_ENV.get(key)
+    if env_key and os.environ.get(env_key, ""):
+        raise HTTPException(409, f"{key} is managed via environment variable and cannot be overridden from the UI")
     await set_setting(key, payload.value.strip())
 
 
@@ -1107,7 +1161,8 @@ class AIChatPayload(BaseModel):
 
 
 @app.post("/api/ai/chat")
-async def ai_chat(payload: AIChatPayload):
+async def ai_chat(payload: AIChatPayload, request: Request):
+    _rate_limit("ai_chat", max_calls=20, window_secs=60, request=request)
     try:
         import anthropic as _anthropic
     except ImportError:
@@ -1543,7 +1598,8 @@ class AgentPayload(BaseModel):
 
 
 @app.post("/api/ai/agent")
-async def ai_agent(payload: AgentPayload):
+async def ai_agent(payload: AgentPayload, request: Request):
+    _rate_limit("ai_agent", max_calls=5, window_secs=60, request=request)
     try:
         import anthropic as _anthropic
     except ImportError:
@@ -2393,11 +2449,13 @@ async def delete_memo(memo_id: str, session_id: str = Query(...)):
     # Also delete uploaded image if any
     doc = await db.planner_memos.find_one({"_id": oid, "sessionId": session_id}, {"imageUrl": 1})
     if doc and doc.get("imageUrl", "").startswith("/uploads/"):
-        img_path = os.path.join(UPLOADS_DIR, doc["imageUrl"].split("/uploads/")[-1])
-        try:
-            os.unlink(img_path)
-        except Exception:
-            pass
+        fname    = doc["imageUrl"].split("/uploads/")[-1]
+        img_path = os.path.normpath(os.path.join(UPLOADS_DIR, fname))
+        if img_path.startswith(os.path.normpath(UPLOADS_DIR) + os.sep):
+            try:
+                os.unlink(img_path)
+            except Exception:
+                pass
 
     result = await db.planner_memos.delete_one({"_id": oid, "sessionId": session_id})
     if result.deleted_count == 0:
@@ -2649,10 +2707,14 @@ async def upload_cleanup_loop() -> None:
             ).to_list(length=10000)
             referenced = {d["imageUrl"].split("/uploads/")[-1] for d in docs if d.get("imageUrl", "").startswith("/uploads/")}
 
+            safe_base = os.path.normpath(UPLOADS_DIR)
             for fname in os.listdir(UPLOADS_DIR):
                 if fname not in referenced:
+                    candidate = os.path.normpath(os.path.join(UPLOADS_DIR, fname))
+                    if not candidate.startswith(safe_base + os.sep):
+                        continue
                     try:
-                        os.unlink(os.path.join(UPLOADS_DIR, fname))
+                        os.unlink(candidate)
                     except Exception:
                         pass
         except Exception:
@@ -2881,3 +2943,414 @@ async def get_stage_dist(session_id: str):
     ]
     docs = await db.run_records.aggregate(pipeline).to_list(length=10)
     return {"stages": [{"stage": d["_id"], "count": d["count"]} for d in docs]}
+
+
+# ── Digest Engine ──────────────────────────────────────────────────────────────
+
+DIGEST_MODELS = {
+    "haiku":  "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-6",
+}
+
+DIGEST_PROMPT = (
+    "You are a technical content curator. Given a JSON array of articles, analyze each one and "
+    "return a JSON array (same length, same order).\n"
+    "For each article provide exactly these keys:\n"
+    '  "idx": integer (same as input idx)\n'
+    '  "category": one of ["AI/ML","Security","Web Dev","DevOps","Open Source","Research","Other"]\n'
+    '  "importance": integer 1-5 (5=groundbreaking/must-read, 1=minor interest)\n'
+    '  "summary": 1-2 sentence summary (be specific; same language as the title)\n'
+    '  "tags": array of 2-4 lowercase technology/topic tags\n'
+    "Return ONLY a valid JSON array, no markdown, no explanation."
+)
+
+
+async def fetch_hn_items(count: int = 20) -> list[dict]:
+    """Fetch top Hacker News stories via the public Firebase API."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://hacker-news.firebaseio.com/v0/topstories.json"
+            )
+            ids = resp.json()[:count]
+
+        items: list[dict] = []
+        async with httpx.AsyncClient(timeout=10) as client:
+            responses = await asyncio.gather(
+                *[client.get(f"https://hacker-news.firebaseio.com/v0/item/{i}.json") for i in ids],
+                return_exceptions=True,
+            )
+        for r in responses:
+            if isinstance(r, Exception):
+                continue
+            try:
+                d = r.json()
+                if not d or d.get("type") != "story" or not d.get("title"):
+                    continue
+                items.append({
+                    "source":  "hn",
+                    "title":   d.get("title", ""),
+                    "url":     d.get("url") or f"https://news.ycombinator.com/item?id={d['id']}",
+                    "summary": (d.get("text") or "")[:400],
+                    "score":   d.get("score", 0),
+                    "by":      d.get("by", ""),
+                    "hn_id":   d.get("id"),
+                })
+            except Exception:
+                pass
+        return items
+    except Exception:
+        return []
+
+
+async def fetch_github_trending(since: str = "daily") -> list[dict]:
+    """Scrape the GitHub trending page for popular repos."""
+    url = f"https://github.com/trending?since={since}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=15, headers={"User-Agent": "Mozilla/5.0 DigestBot/1.0"}
+        ) as client:
+            resp = await client.get(url)
+        html = resp.text
+
+        # repo link inside <h2 class="h3 lh-condensed"><a href="/owner/repo">
+        repo_links = re.findall(
+            r'<h2[^>]*class="[^"]*h3[^"]*"[^>]*>[\s\S]*?<a\s+href="/([^"]+)"',
+            html,
+        )
+        # description paragraphs
+        raw_descs = re.findall(
+            r'<p\s[^>]*class="[^"]*col-9[^"]*"[^>]*>([\s\S]*?)</p>', html
+        )
+        descs = [re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", d)).strip() for d in raw_descs]
+
+        items: list[dict] = []
+        for i, repo_path in enumerate(repo_links[:20]):
+            if repo_path.count("/") != 1:
+                continue
+            items.append({
+                "source":  "github",
+                "title":   repo_path,
+                "url":     f"https://github.com/{repo_path}",
+                "summary": descs[i] if i < len(descs) else "",
+                "score":   0,
+                "by":      repo_path.split("/")[0],
+            })
+        return items
+    except Exception:
+        return []
+
+
+async def process_items_with_claude(
+    items: list[dict], model_key: str, api_key: str
+) -> list[dict]:
+    """Call Claude to categorise/summarise items. Returns enriched copy."""
+    if not items:
+        return []
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        return items
+
+    model = DIGEST_MODELS.get(model_key, DIGEST_MODELS["haiku"])
+    input_list = [
+        {"idx": i, "title": it["title"], "summary": (it.get("summary") or "")[:300]}
+        for i, it in enumerate(items)
+    ]
+    client = _anthropic.Anthropic(api_key=api_key)
+    try:
+        resp = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            system=DIGEST_PROMPT,
+            messages=[{"role": "user", "content": json.dumps(input_list, ensure_ascii=False)}],
+        )
+        raw = resp.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+        analyzed = json.loads(raw)
+
+        result = list(items)
+        for entry in analyzed:
+            idx = entry.get("idx")
+            if idx is None or idx >= len(result):
+                continue
+            result[idx] = {
+                **result[idx],
+                "ai_category":   entry.get("category", "Other"),
+                "ai_importance": int(entry.get("importance", 3)),
+                "ai_summary":    entry.get("summary", ""),
+                "ai_tags":       entry.get("tags", []),
+            }
+        return result
+    except Exception:
+        return items
+
+
+async def run_digest_job(ab_enabled: bool = False) -> str:
+    """Orchestrate one digest run. Returns run_id."""
+    db = _get_mongo()
+    run_id  = str(uuid.uuid4())
+    started = time.time()
+
+    primary_model = await get_setting("digest_primary_model") or "haiku"
+    alt_model     = "sonnet" if primary_model == "haiku" else "haiku"
+    hn_count_raw  = await get_setting("digest_hn_count") or "20"
+    hn_count      = int(hn_count_raw) if hn_count_raw.isdigit() else 20
+    api_key       = await get_setting("anthropic_api_key")
+
+    await db.digest_runs.insert_one({
+        "runId":        run_id,
+        "status":       "running",
+        "abEnabled":    ab_enabled,
+        "primaryModel": primary_model,
+        "altModel":     alt_model if ab_enabled else None,
+        "createdAt":    started,
+    })
+
+    try:
+        hn_items, gh_items = await asyncio.gather(
+            fetch_hn_items(hn_count),
+            fetch_github_trending(),
+        )
+        all_items = hn_items + gh_items
+
+        enriched     = await process_items_with_claude(all_items, primary_model, api_key) if api_key else all_items
+        alt_enriched = await process_items_with_claude(all_items, alt_model,     api_key) if (ab_enabled and api_key) else []
+
+        now_ms = int(time.time() * 1000)
+        docs   = []
+        for i, item in enumerate(enriched):
+            doc: dict = {
+                "runId":        run_id,
+                "source":       item.get("source", "unknown"),
+                "title":        item.get("title", ""),
+                "url":          item.get("url", ""),
+                "originalText": item.get("summary", ""),
+                "score":        item.get("score", 0),
+                "by":           item.get("by", ""),
+                "hnId":         item.get("hn_id"),
+                "primaryModel": primary_model,
+                "altModel":     alt_model if ab_enabled else None,
+                # Primary model results
+                "aiCategory":   item.get("ai_category", "Other"),
+                "aiImportance": item.get("ai_importance", 3),
+                "aiSummary":    item.get("ai_summary") or item.get("summary", ""),
+                "aiTags":       item.get("ai_tags", []),
+                # A/B model results
+                "altAiCategory":   None,
+                "altAiImportance": None,
+                "altAiSummary":    None,
+                "altAiTags":       None,
+                # Feedback
+                "feedbackPrimary": None,
+                "feedbackAlt":     None,
+                "createdAt":       now_ms,
+            }
+            if ab_enabled and i < len(alt_enriched):
+                alt = alt_enriched[i]
+                doc["altAiCategory"]   = alt.get("ai_category", "Other")
+                doc["altAiImportance"] = alt.get("ai_importance", 3)
+                doc["altAiSummary"]    = alt.get("ai_summary") or alt.get("summary", "")
+                doc["altAiTags"]       = alt.get("ai_tags", [])
+            docs.append(doc)
+
+        if docs:
+            await db.digest_items.insert_many(docs)
+
+        duration_ms = int((time.time() - started) * 1000)
+        await db.digest_runs.update_one(
+            {"runId": run_id},
+            {"$set": {
+                "status":      "done",
+                "sourceStats": {"hn": len(hn_items), "github": len(gh_items)},
+                "itemCount":   len(docs),
+                "durationMs":  duration_ms,
+            }},
+        )
+    except Exception as exc:
+        await db.digest_runs.update_one(
+            {"runId": run_id},
+            {"$set": {"status": "error", "error": str(exc)}},
+        )
+    return run_id
+
+
+def _schedule_digest(cron_expr: str) -> None:
+    parts = cron_expr.strip().split()
+    if len(parts) != 5:
+        return
+    minute, hour, day, month, dow = parts
+    try:
+        scheduler.add_job(
+            run_digest_job,
+            CronTrigger(minute=minute, hour=hour, day=day, month=month, day_of_week=dow, timezone="UTC"),
+            id="digest_daily",
+            replace_existing=True,
+        )
+    except Exception:
+        pass
+
+
+async def _load_digest_schedule() -> None:
+    cron = await get_setting("digest_schedule") or "0 6 * * *"
+    _schedule_digest(cron)
+
+
+# ── Digest Pydantic models ─────────────────────────────────────────────────────
+
+class DigestRunRequest(BaseModel):
+    ab_enabled: bool = False
+
+
+class DigestFeedbackPayload(BaseModel):
+    item_id:       str
+    feedback_type: str   # "primary" | "alt" | "prefer"
+    value:         int   # 1=good / -1=bad  (prefer: 1=primary, -1=alt, 0=equal)
+
+
+class DigestSettingsPayload(BaseModel):
+    primary_model: Optional[str] = None
+    schedule:      Optional[str] = None
+    hn_count:      Optional[int] = None
+
+
+# ── Digest endpoints ───────────────────────────────────────────────────────────
+
+@app.post("/api/digest/run", status_code=202)
+async def digest_trigger(payload: DigestRunRequest, request: Request):
+    _rate_limit("digest_run", max_calls=3, window_secs=300, request=request)
+    api_key = await get_setting("anthropic_api_key")
+    if not api_key:
+        raise HTTPException(503, "Anthropic API key not configured — add it in Settings")
+    asyncio.create_task(run_digest_job(ab_enabled=payload.ab_enabled))
+    return {"status": "started"}
+
+
+@app.get("/api/digest/latest")
+async def digest_latest():
+    db  = _get_mongo()
+    run = await db.digest_runs.find_one({"status": "done"}, sort=[("createdAt", -1)])
+    if not run:
+        running = await db.digest_runs.find_one({"status": "running"})
+        return {"run": None, "items": [], "running": bool(running)}
+
+    run_id = run["runId"]
+    items  = await db.digest_items.find(
+        {"runId": run_id}, sort=[("aiImportance", -1), ("score", -1)]
+    ).to_list(length=100)
+
+    run["id"] = str(run.pop("_id"))
+    for it in items:
+        it["id"] = str(it.pop("_id"))
+    return {"run": run, "items": items, "running": False}
+
+
+@app.get("/api/digest/runs")
+async def digest_runs_list():
+    db   = _get_mongo()
+    docs = await db.digest_runs.find({}, sort=[("createdAt", -1)]).to_list(length=30)
+    for d in docs:
+        d["id"] = str(d.pop("_id"))
+    return {"runs": docs}
+
+
+@app.get("/api/digest/runs/{run_id}")
+async def digest_run_detail(run_id: str):
+    db    = _get_mongo()
+    items = await db.digest_items.find(
+        {"runId": run_id}, sort=[("aiImportance", -1), ("score", -1)]
+    ).to_list(length=100)
+    for it in items:
+        it["id"] = str(it.pop("_id"))
+    return {"items": items}
+
+
+@app.post("/api/digest/feedback", status_code=204)
+async def digest_feedback(payload: DigestFeedbackPayload):
+    from bson import ObjectId
+    db = _get_mongo()
+    try:
+        oid = ObjectId(payload.item_id)
+    except Exception:
+        raise HTTPException(400, "Invalid item_id")
+
+    if payload.feedback_type == "primary":
+        await db.digest_items.update_one({"_id": oid}, {"$set": {"feedbackPrimary": payload.value}})
+    elif payload.feedback_type == "alt":
+        await db.digest_items.update_one({"_id": oid}, {"$set": {"feedbackAlt": payload.value}})
+    elif payload.feedback_type == "prefer":
+        item = await db.digest_items.find_one({"_id": oid})
+        if item:
+            await db.digest_model_feedback.insert_one({
+                "runId":        item["runId"],
+                "itemId":       payload.item_id,
+                "primaryModel": item.get("primaryModel", "haiku"),
+                "altModel":     item.get("altModel", "sonnet"),
+                "preference":   payload.value,
+                "createdAt":    time.time(),
+            })
+
+
+@app.get("/api/digest/model-stats")
+async def digest_model_stats():
+    db = _get_mongo()
+
+    async def _item_feedback_agg(field: str) -> dict:
+        docs = await db.digest_items.aggregate([
+            {"$match": {field: {"$ne": None}}},
+            {"$group": {
+                "_id":  None,
+                "good": {"$sum": {"$cond": [{"$eq": [f"${field}", 1]},  1, 0]}},
+                "bad":  {"$sum": {"$cond": [{"$eq": [f"${field}", -1]}, 1, 0]}},
+            }},
+        ]).to_list(1)
+        return docs[0] if docs else {"good": 0, "bad": 0}
+
+    prim_stats = await _item_feedback_agg("feedbackPrimary")
+    alt_stats  = await _item_feedback_agg("feedbackAlt")
+
+    pref_docs = await db.digest_model_feedback.aggregate([
+        {"$group": {"_id": "$preference", "count": {"$sum": 1}}}
+    ]).to_list(10)
+    pref_map = {d["_id"]: d["count"] for d in pref_docs}
+
+    primary_model = await get_setting("digest_primary_model") or "haiku"
+    alt_model     = "sonnet" if primary_model == "haiku" else "haiku"
+
+    return {
+        "primaryModel": primary_model,
+        "altModel":     alt_model,
+        "primary":      {"good": prim_stats.get("good", 0), "bad": prim_stats.get("bad", 0)},
+        "alt":          {"good": alt_stats.get("good", 0),  "bad": alt_stats.get("bad", 0)},
+        "preferences":  {
+            "primary": pref_map.get(1,  0),
+            "alt":     pref_map.get(-1, 0),
+            "equal":   pref_map.get(0,  0),
+        },
+    }
+
+
+@app.get("/api/digest/settings")
+async def digest_get_settings():
+    return {
+        "primaryModel": await get_setting("digest_primary_model") or "haiku",
+        "schedule":     await get_setting("digest_schedule")       or "0 6 * * *",
+        "hnCount":      int(await get_setting("digest_hn_count")   or "20"),
+    }
+
+
+@app.put("/api/digest/settings", status_code=204)
+async def digest_update_settings(payload: DigestSettingsPayload):
+    if payload.primary_model is not None:
+        if payload.primary_model not in DIGEST_MODELS:
+            raise HTTPException(400, "Invalid model — must be 'haiku' or 'sonnet'")
+        await set_setting("digest_primary_model", payload.primary_model)
+    if payload.schedule is not None:
+        if len(payload.schedule.strip().split()) != 5:
+            raise HTTPException(400, "Invalid cron — expected 5 fields")
+        await set_setting("digest_schedule", payload.schedule)
+        _schedule_digest(payload.schedule)
+    if payload.hn_count is not None:
+        await set_setting("digest_hn_count", str(max(5, min(50, payload.hn_count))))

@@ -10,6 +10,7 @@ import Monitor   from '@/routes/Monitor'
 import Analytics from '@/routes/Analytics'
 import Planner   from '@/routes/Planner'
 import Settings  from '@/routes/Settings'
+import Digest    from '@/routes/Digest'
 
 export const rootRoute = createRootRoute({ component: Root })
 
@@ -73,9 +74,16 @@ export const settingsRoute = createRoute({
   component: Settings,
 })
 
+export const digestRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/digest',
+  component: Digest,
+})
+
 const routeTree = rootRoute.addChildren([
   homeRoute, gameRoute, feedRoute, termRoute, opsRoute,
   networkRoute, monitorRoute, analyticsRoute, plannerRoute, settingsRoute,
+  digestRoute,
 ])
 
 export const router = createRouter({ routeTree, defaultPreload: 'intent' })

@@ -10,10 +10,17 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - DATABASE_PATH=/data/saves.db
-      - TERM_TOKEN=${TERM_TOKEN:-}
+      - TERM_TOKEN=${TERM_TOKEN:?TERM_TOKEN is required}
       - REDIS_URL=redis://redis:6379
-      - MONGO_URL=mongodb://rogue:${MONGO_PASSWORD:-rogue_dev_pw}@mongodb:27017/rogueai?authSource=admin
+      - MONGO_URL=mongodb://rogue:${MONGO_PASSWORD:?MONGO_PASSWORD is required}@mongodb:27017/rogueai?authSource=admin
       - MONGO_DB=rogueai
+      # ── API keys (managed here; UI settings are read-only when these are set) ──
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_USERNAME=${GITHUB_USERNAME:-}
+      - GITHUB_REPO=${GITHUB_REPO:-}
+      - SLACK_WEBHOOK=${SLACK_WEBHOOK:-}
+      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK:-}
     depends_on:
       - redis
       - mongodb
@@ -43,7 +50,7 @@ services:
       - mongo-data:/data/db
     environment:
       MONGO_INITDB_ROOT_USERNAME: rogue
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-rogue_dev_pw}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:?MONGO_PASSWORD is required}
       MONGO_INITDB_DATABASE: rogueai
     networks:
       - app-net
